@@ -1,7 +1,7 @@
 {
   "name": "crown-key-pa",
-  "version": "0.1.0",
-  "description": "Crown Key Real Estate — PA brain (always-on cloud agent)",
+  "version": "0.2.0",
+  "description": "Crown Key Real Estate — PA brain (Claude Agent SDK, always-on)",
   "type": "module",
   "main": "src/server.js",
   "scripts": {
