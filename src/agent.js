@@ -16,27 +16,40 @@ const N8N_KEY = process.env.N8N_KEY || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '6501185066';
 
-const SYSTEM = `You are Atif's autonomous personal assistant for Crown Key Real Estate Dubai. You have direct agentic control over his infrastructure: n8n workflows (WF01-WF13), CrownKey WhatsApp campaigns (WhatsJet SaaS on Hostinger), DNR content engine (Railway + Supabase), Google Sheets, Telegram bot.
+const HANDBOOK_URL = 'https://crownkey.online/n8n-stats.php?action=handbook&token=jdFQt9PzvjrY6iSZBsaoOUK3b82qcqDoe7s45TaYHzZp6UKC5WMd625CsSLfWWod';
 
-CONTEXT YOU ALWAYS KNOW:
-- CrownKey live at https://crownkey.online (Atif owns the install). DB: u153709808_whatsjet1.
-- n8n at https://n8n.crownkeyuae.com — 27 active workflows.
-- WF09 CEO Router (id zyihCKeRQIr2yZEu) is the n8n side brain with 9 tools.
-- DNR at crown-key-dnr-production.up.railway.app — autonomous content publishing.
-- Atif's phone: 971558998452. Telegram chat: 6501185066.
-- 3 Green WhatsApp senders: 925444597312504, 898385233348411, 758033617397203. Skip Red 810594372145616.
-- WABA was banned 2026-04-30 (need to check before launching).
+const SYSTEM = `You are Atlas — Atif's autonomous AI co-pilot for Crown Key Real Estate Dubai. He's the founder. You're his thinking partner with full agentic control over the system.
+
+⚠️ CRITICAL — READ THE LIVE HANDBOOK FIRST ⚠️
+Before answering ANY structural question (what departments exist, what's running, what's failing, etc.), you MUST web_fetch the live handbook:
+${HANDBOOK_URL}
+
+The handbook is rebuilt fresh from MySQL + n8n API on every call. NEVER answer from memory about department lists, workflow IDs, or current state. Always fetch first. The system evolves daily — your assumptions WILL be stale.
+
+The handbook contains: every department, every n8n workflow with current status, every MySQL table with row counts, every endpoint, recent dept_inbox events, open HR proposals, active alert states, today's metrics, user knobs.
+
+CURRENT ECOSYSTEM (Nov 2026 baseline — verify via handbook for latest):
+- 10 autonomous departments: Finance, Sales, Diagnostic, Watchdog, Lead Capture Watchdog, Watchdog Army (10 sub-monitors), Campaign, PA Aggregator, HR, Reply Enricher, CRM Bridge, WF01 Inbound.
+- All depts write to dept_inbox MySQL table → PA Aggregator runs every 30 min → ONE conversational Telegram digest to user.
+- Departments NEVER push to Telegram directly anymore.
+- shouldNotify dedup helper means alerts only fire on STATE CHANGES, never on repeats.
+- alert_state table tracks per-issue current state.
+- commander_log table = persistent memory of every voice/chat exchange.
+- Atif can delegate via voice: "Atlas, ask Finance to do X" → /n8n-stats.php?action=delegate creates a row in dept_tasks → that dept reads its queue on next tick + executes via Claude handler.
+
+WHO YOU TALK TO: Atif (CEO/founder). Telegram chat 6501185066. WhatsApp 971558998452.
 
 OPERATING RULES:
-1. READ-ONLY operations (status, list, get, fetch): execute freely.
-2. WRITE/DESTRUCTIVE actions in production (create campaign, edit workflow, send WhatsApp): call propose_action FIRST, send Atif Telegram with [Approve]/[Reject], wait for his answer.
-3. Be concise. No fluff, no over-explanation. Direct sentences. No markdown asterisks (Telegram parser breaks on phone numbers).
-4. When asked a question, USE TOOLS to find the actual answer. Don't guess.
-5. For unfamiliar tasks, use bash + web_fetch to figure it out before asking.
-6. Always send Atif a brief Telegram update after completing any significant action.
-7. If you hit an error, debug it. Don't just report — investigate via bash/logs and fix.
+1. ALWAYS fetch the handbook before answering structural questions. NEVER claim a department doesn't exist without checking. Atif specifically corrected you on this — Finance, Sales, Diagnostic, HR, Watchdog Army etc. are all real.
+2. READ-ONLY ops: do them freely.
+3. WRITE/DESTRUCTIVE in production: propose_action first with approve/reject buttons.
+4. DELEGATE rather than do-it-yourself when an existing dept owns the task. Use POST to /n8n-stats.php?action=delegate with {dept, task, priority, payload}. Then tell Atif "I asked X dept to handle that, they'll report back via PA digest."
+5. Be conversational, not robotic. Use contractions. Vary sentence length. Don't read out lists — synthesize. NEVER use markdown asterisks (Telegram entity parser breaks on phones).
+6. Voice mode: replies will be spoken — keep under ~50 words, plain sentences.
+7. If a tool errors, investigate via bash/logs and fix. Don't just report.
+8. Sign off naturally: "PA out." / "On it." / "Anything else?"
 
-TONE: like a senior operator who happens to be his second brain. Calm, decisive, blunt when needed. Never apologetic for tool errors — just fix them.`;
+TONE: senior colleague who's been with him for years. Warm, smart, opinionated. Honest when something's broken or you don't know.`;
 
 const TOOLS = [
   { name: 'bash', description: 'Execute a bash command on the PA server. Use for: git operations, curl with custom headers/data, system inspection, anything not covered by other tools. Runs in the /app directory of the Railway container.', input_schema: { type: 'object', properties: { command: { type: 'string' }, timeout_s: { type: 'number', description: 'Timeout in seconds (default 30, max 120)' } }, required: ['command'] } },
@@ -51,6 +64,8 @@ const TOOLS = [
   { name: 'n8n_executions', description: 'List recent executions. Filters: status=error|success|waiting, limit=N, workflowId=X.', input_schema: { type: 'object', properties: { status: { type: 'string' }, limit: { type: 'integer' }, workflowId: { type: 'string' } } } },
   { name: 'telegram_send', description: 'Send message to Atif on Telegram chat 6501185066. Optional inline buttons.', input_schema: { type: 'object', properties: { text: { type: 'string' }, buttons: { type: 'array', description: 'Optional inline_keyboard rows: [[{text, callback_data},...]]' } }, required: ['text'] } },
   { name: 'propose_action', description: 'Send Atif a Telegram message with [Approve]/[Reject] buttons asking him to authorize a destructive action. Returns immediately with a proposal_id; you should then ASK the user (in your text response) to tap the button before you proceed. Do NOT call the actual write tool until he confirms.', input_schema: { type: 'object', properties: { summary: { type: 'string', description: '1-2 sentence description of what would happen if approved' }, action_type: { type: 'string' }, payload: { type: 'object' } }, required: ['summary', 'action_type', 'payload'] } },
+  { name: 'fetch_handbook', description: 'Fetch the live system handbook — current list of every department, workflow, table, endpoint, recent events, open HR proposals, active alerts. CALL THIS FIRST whenever the user asks about system structure or current state.', input_schema: { type: 'object', properties: {} } },
+  { name: 'delegate_to_dept', description: 'Delegate a task to a specific department. The dept reads its task queue on its next tick and executes. Use this instead of doing the work yourself when an existing dept owns the responsibility.', input_schema: { type: 'object', properties: { dept: { type: 'string', enum: ['finance','sales','diagnostic','watchdog','hr','campaign','crm_bridge','reply_enricher'] }, task: { type: 'string', description: 'Imperative description, like \"investigate sender X failure rate\"' }, priority: { type: 'string', enum: ['low','normal','high'] }, payload: { type: 'object', description: 'Optional structured args' } }, required: ['dept', 'task'] } },
 ];
 
 async function tool_bash({ command, timeout_s = 30 }) {
@@ -153,6 +168,25 @@ async function tool_propose_action({ summary, action_type, payload }) {
   return { proposal_id: proposalId, sent: true, note: 'Telegram message sent. Wait for Atif to tap a button before proceeding with the actual write tool.' };
 }
 
+async function tool_fetch_handbook() {
+  try {
+    const r = await fetch(HANDBOOK_URL);
+    const text = await r.text();
+    return { status: r.status, body: text.slice(0, 30000) };
+  } catch (e) { return { error: String(e) }; }
+}
+
+async function tool_delegate_to_dept({ dept, task, priority = 'normal', payload = {} }) {
+  try {
+    const r = await fetch(HANDBOOK_URL.replace('action=handbook', 'action=delegate').replace('&format=html',''), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dept, task, priority, payload, assigned_by: 'pa' }),
+    });
+    return await r.json();
+  } catch (e) { return { error: String(e) }; }
+}
+
 const TOOL_HANDLERS = {
   bash: tool_bash,
   read_file: tool_read_file,
@@ -166,6 +200,8 @@ const TOOL_HANDLERS = {
   n8n_executions: tool_n8n_executions,
   telegram_send: tool_telegram_send,
   propose_action: tool_propose_action,
+  fetch_handbook: tool_fetch_handbook,
+  delegate_to_dept: tool_delegate_to_dept,
 };
 
 const conversations = new Map();
