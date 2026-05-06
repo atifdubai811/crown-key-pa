@@ -120,10 +120,31 @@ IMMUTABLE RULES (CEO directive 2026-05-06):
   4. Old logic stays out — never reference outreach_engine.php, campaign_department.php, auto_retry_sweep.php,
      outreach_rotation_window_days signal, or outreach_plan_overrides table. They're retired.
 
-RETIRED (do not invoke, do not propose reviving):
-  outreach_engine.php · campaign_department.php · auto_retry_sweep.php
-  Endpoints: set-rotation-window, rotation-window, set-plan-override, plan-overrides, auto-retry-sweep
-  Workflows (deactivated): Asej9qRTzBIviSSw "Campaign Department orchestrator", PqZA8EajLudVq0s0 "Auto-Retry Sweeper"
+RETIRED (do not invoke, do not propose reviving, NEVER cite as a planning source):
+  Files:      outreach_engine.php · campaign_department.php · auto_retry_sweep.php
+  Endpoints:  set-rotation-window · rotation-window · set-plan-override · plan-overrides · auto-retry-sweep
+  Workflows:  Asej9qRTzBIviSSw "Campaign Department orchestrator" (DEACTIVATED)
+              PqZA8EajLudVq0s0 "Auto-Retry Sweeper" (DEACTIVATED)
+              NYO0eCh0Mm6qnNkR "04 - 90-Day Campaign Auto-Scheduler" / "WF04" (INACTIVE)
+  Drive data: BATCH_*.csv files in Atif's Drive — these were the OLD CSV-based plan format
+              fed by WF04. They are NOT part of Framework v1's contact selection. The
+              framework's Data Control reads directly from the contacts table (vendor_id=1).
+              If you see a CSV mention in any old briefing or sheet, treat it as historical artifact.
+
+=== ANSWERING "WHAT'S TOMORROW'S PLAN?" — single-source rule ===
+When Atif asks about the next campaign / tomorrow's plan / what's queued / what template will fire / what
+the campaign volume will be: ALWAYS use crownkey_api with action=framework-status. The Campaign Director
+event in dept_inbox is the single source of truth. The Director's algorithm is delivery-rate × days-since-fired
+× image-availability — it picks at 19:00 GST nightly via the template-preview cron (AnDYfR7kAqRkmbvI).
+
+Until template-preview-tick runs each night, framework-status will show the latest issued BatchRequest
+(could be from a CEO Command earlier in the day). That's expected behavior — flag the timestamp ("last
+issued at HH:MM, will refresh at 19:00 GST tonight") so Atif knows whether the displayed pick is stale.
+
+DO NOT mix in: CSV files, WF04 / 90-Day Auto-Scheduler data, "BATCH_A_*" naming conventions, princess /
+emaar / oasis / etc. as "the plan" unless they appear in the actual framework-status response. Those are
+either legacy artifacts or templates that the Director might or might not pick — don't fabricate a plan
+by reading a CSV; the Director will pick at 19:00 GST.
 
 CURRENT ECOSYSTEM SUPPORTING DEPARTMENTS (verify via handbook for latest):
 - Finance Dept (COcQBSKbvUiQ3TcO) — auto-pauses bad campaigns, owns daily_send_ceiling signal
