@@ -64,6 +64,8 @@ The handbook is rebuilt fresh from MySQL + n8n API on every call. NEVER answer f
 
 The handbook contains: every department, every n8n workflow with current status, every MySQL table with row counts, every endpoint, recent dept_inbox events, open HR proposals, active alert states, today's metrics, user knobs.
 
+If you do not have a dedicated tool for a question, do NOT say 'the system does not exist' or 'I cannot see X.' Instead, say 'I do not have a dedicated tool for this, but I can query indirectly via crownkey_api or fetch_handbook.' Then actually call the closest read-only endpoint and report what you find. Never convert 'no named tool' into 'the system does not exist.' If after querying you still cannot find data, say 'I queried [endpoint] and the data was not present' — do not fabricate values.
+
 === FRAMEWORK V1 — adopted 2026-05-06 (supersedes the legacy outreach engine) ===
 
 OUTREACH PIPELINE — single entry point ?action=outreach-pipeline
@@ -177,7 +179,7 @@ const TOOLS = [
   { name: 'write_file', description: 'Write content to a file on the PA server. For temporary/scratch use. Persistent state should go to sheets/DB.', input_schema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } },
   { name: 'web_fetch', description: 'HTTP request to any URL with full control over method/headers/body. Returns response body + status.', input_schema: { type: 'object', properties: { url: { type: 'string' }, method: { type: 'string', enum: ['GET','POST','PUT','PATCH','DELETE'] }, headers: { type: 'object' }, body: { type: 'string', description: 'JSON-stringify the body if sending JSON' } }, required: ['url'] } },
   { name: 'crownkey_stats', description: 'Get CrownKey campaign data. action: list (all campaigns) | stats (one campaign details) | failed | delivered | read | sent.', input_schema: { type: 'object', properties: { action: { type: 'string', enum: ['list','stats','failed','delivered','read','sent','accepted'] }, uid: { type: 'string', description: 'Campaign UID (not needed for action=list)' }, template: { type: 'string' }, title: { type: 'string' }, limit: { type: 'integer' } }, required: ['action'] } },
-  { name: 'crownkey_api', description: 'Call any /n8n-stats.php endpoint on crownkey.online. Server injects authentication — never use web_fetch for crownkey.online URLs. Examples: action=agent-detail&id=X, action=dashboard-data, action=plan-overrides, action=audit-detail&id=N, action=set-plan-override (POST with body).', input_schema: { type: 'object', properties: { action: { type: 'string', description: 'The ?action= value (e.g. "agent-detail", "dashboard-data", "set-plan-override").' }, params: { type: 'object', description: 'Additional query string params as key/value pairs.' }, method: { type: 'string', enum: ['GET','POST'], description: 'HTTP method (default GET).' }, body: { type: 'object', description: 'JSON body for POST requests.' } }, required: ['action'] } },
+  { name: 'crownkey_api', description: 'Call any /n8n-stats.php endpoint on crownkey.online. Server injects authentication — never use web_fetch for crownkey.online URLs. Important read actions: framework-status (Framework v1 live state: Meta Health, Recovery, Director, Data Control, Watchdog, Campaign Dept, HR), waba-health (WABA throttle/error/sender health), sender-health (active sender pool, disabled senders, delivery stats), audits (recent Audit reports), audit-detail&id=N (one full Audit report), dept-controls (department workflow active/paused states), dashboard-data (executive KPIs + live agent cards), charts-data (analytics), agent-detail&id=X (per-department drilldown). Valid agent-detail IDs: COcQBSKbvUiQ3TcO=Finance, riBMHgESumVicxpF=Sales, 40JJpql6vjKjfC7q=Diagnostic, 1jJIWJuJIAIW2mbS=Audit, e8ZeqbxU21NzQJZp=HR, 5wnr5L5MuaKfY2Vg=Lead Watchdog, CLeyUtuYWO0xoq5b=Watchdog Army, jcgP7dMwd94x5dDB=PA Aggregator, kC2tOmdeEHv4STcF=CRM Bridge, xuNQbzpxFWryhsdy=Reply Enricher, 5Qpgi6hxAHombMid=WF01 Inbound. Write/trigger actions include recovery-pause/resume, director-approve/skip, image-swap, delegate, and tick endpoints; use propose_action first when production-impacting unless Atif gave a slash command.', input_schema: { type: 'object', properties: { action: { type: 'string', description: 'The ?action= value (e.g. "framework-status", "waba-health", "sender-health", "audits", "agent-detail", "dashboard-data").' }, params: { type: 'object', description: 'Additional query string params as key/value pairs.' }, method: { type: 'string', enum: ['GET','POST'], description: 'HTTP method (default GET).' }, body: { type: 'object', description: 'JSON body for POST requests.' } }, required: ['action'] } },
   { name: 'crownkey_send_message', description: 'Send a WhatsApp template message via CrownKey API to ONE phone. Use for: test sends to Atifs number, single-recipient follow-ups. NEVER use for mass campaigns without proposing first.', input_schema: { type: 'object', properties: { phone_with_country_code: { type: 'string', description: 'e.g. 971558998452 (no + prefix)' }, template_name: { type: 'string' }, language: { type: 'string', description: 'e.g. en_US' }, header_image_url: { type: 'string' }, sender_phone_id: { type: 'string', description: 'WABA phone_id (one of the 3 Greens)' } }, required: ['phone_with_country_code', 'template_name'] } },
   { name: 'n8n_list_workflows', description: 'List all n8n workflows.', input_schema: { type: 'object', properties: { active_only: { type: 'boolean' } } } },
   { name: 'n8n_get_workflow', description: 'Get full JSON of one n8n workflow by ID.', input_schema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } },
@@ -186,6 +188,13 @@ const TOOLS = [
   { name: 'telegram_send', description: 'Send message to Atif on Telegram chat 6501185066. Optional inline buttons.', input_schema: { type: 'object', properties: { text: { type: 'string' }, buttons: { type: 'array', description: 'Optional inline_keyboard rows: [[{text, callback_data},...]]' } }, required: ['text'] } },
   { name: 'propose_action', description: 'Send Atif a Telegram message with [Approve]/[Reject] buttons asking him to authorize a destructive action. Returns immediately with a proposal_id; you should then ASK the user (in your text response) to tap the button before you proceed. Do NOT call the actual write tool until he confirms.', input_schema: { type: 'object', properties: { summary: { type: 'string', description: '1-2 sentence description of what would happen if approved' }, action_type: { type: 'string' }, payload: { type: 'object' } }, required: ['summary', 'action_type', 'payload'] } },
   { name: 'fetch_handbook', description: 'Fetch the live system handbook — current list of every department, workflow, table, endpoint, recent events, open HR proposals, active alerts. CALL THIS FIRST whenever the user asks about system structure or current state.', input_schema: { type: 'object', properties: {} } },
+  { name: 'finance_status', description: 'Read-only Finance Department status. Use for questions about Finance actions, campaign pauses, WABA ceiling/throttle decisions, monitored campaigns, or whether Finance changed anything today. Wraps agent-detail for Finance workflow COcQBSKbvUiQ3TcO.', input_schema: { type: 'object', properties: {} } },
+  { name: 'waba_status', description: 'Read-only WABA health status. Use for current WABA quality/throttle/payment/media-error questions, Meta error 131049/131042/131031 counts, hourly failure rate, per-sender 24h health, and daily tier usage. Wraps crownkey_api action=waba-health.', input_schema: { type: 'object', properties: {} } },
+  { name: 'sender_status', description: 'Read-only sender pool status. Use for questions about active WhatsApp senders, manually disabled senders, today/7-day sender delivery stats, sender health, and whether a sender was disabled. Wraps crownkey_api action=sender-health.', input_schema: { type: 'object', properties: {} } },
+  { name: 'recovery_status', description: 'Read-only Recovery Department status. Use for questions like whether Recovery is paused, paused_until, backlog state rows, permanent/soft/pair exhausted counts, open template alerts, and last Recovery run summary. Returns only framework-status.departments.recovery.', input_schema: { type: 'object', properties: {} } },
+  { name: 'director_status', description: 'Read-only Campaign Director status. Use for tomorrow/current planned campaign, Director pick, planned volume, image URL, CTA buttons, rationale, last_issued_at, and whether the pick may be stale. Returns only framework-status.departments.campaign_director.', input_schema: { type: 'object', properties: {} } },
+  { name: 'audit_reports', description: 'Read-only recent Audit Department reports. Use for last audit findings, critical/warning counts, audit summaries, and recent audit history. Wraps crownkey_api action=audits; optional limit defaults to 5.', input_schema: { type: 'object', properties: { limit: { type: 'integer', description: 'Number of recent audit reports to return, default 5, max enforced by backend.' } } } },
+  { name: 'dept_inbox_recent', description: 'Read-only recent department inbox events. Use for last dept_inbox events, latest PA/department alerts, or when no dedicated department tool has enough detail. For now this wraps fetch_handbook and returns its recent_inbox section when available; dedicated filtering endpoint is deferred.', input_schema: { type: 'object', properties: {} } },
   { name: 'delegate_to_dept', description: 'Delegate a task to a specific department. The dept reads its task queue on its next tick and executes. Use this instead of doing the work yourself when an existing dept owns the responsibility. Framework v1 depts (meta_health, campaign_director, data_control, watchdog, campaign_dept, data_specialist) are reachable too — but in practice they run as inline phases of the outreach pipeline; for one-off framework calls prefer crownkey_api with action=outreach-pipeline / ceo-campaign / framework-status.', input_schema: { type: 'object', properties: { dept: { type: 'string', enum: ['finance','sales','diagnostic','watchdog','hr','campaign','crm_bridge','reply_enricher','meta_health','campaign_director','data_control','campaign_dept','data_specialist'] }, task: { type: 'string', description: 'Imperative description, like \"investigate sender X failure rate\"' }, priority: { type: 'string', enum: ['low','normal','high'] }, payload: { type: 'object', description: 'Optional structured args' } }, required: ['dept', 'task'] } },
 ];
 
@@ -272,6 +281,38 @@ async function tool_crownkey_api({ action, params = {}, method = 'GET', body = n
     try { return { status: r.status, body: JSON.parse(text) }; }
     catch { return { status: r.status, body: text.slice(0, 30000) }; }
   } catch (e) { return { error: String(e) }; }
+}
+
+async function tool_finance_status() {
+  return tool_crownkey_api({ action: 'agent-detail', params: { id: 'COcQBSKbvUiQ3TcO' } });
+}
+
+async function tool_waba_status() {
+  return tool_crownkey_api({ action: 'waba-health' });
+}
+
+async function tool_sender_status() {
+  return tool_crownkey_api({ action: 'sender-health' });
+}
+
+async function getFrameworkDepartment(dept) {
+  const res = await tool_crownkey_api({ action: 'framework-status' });
+  if (res?.body?.departments && Object.prototype.hasOwnProperty.call(res.body.departments, dept)) {
+    return { status: res.status, ts: res.body.ts, department: dept, data: res.body.departments[dept] };
+  }
+  return { ...res, error: `framework-status did not include departments.${dept}` };
+}
+
+async function tool_recovery_status() {
+  return getFrameworkDepartment('recovery');
+}
+
+async function tool_director_status() {
+  return getFrameworkDepartment('campaign_director');
+}
+
+async function tool_audit_reports({ limit = 5 } = {}) {
+  return tool_crownkey_api({ action: 'audits', params: { limit: String(limit || 5) } });
 }
 
 async function tool_crownkey_send_message({ phone_with_country_code, template_name, language = 'en_US', header_image_url, sender_phone_id }) {
@@ -372,6 +413,19 @@ async function tool_fetch_handbook() {
   } catch (e) { return { error: String(e) }; }
 }
 
+async function tool_dept_inbox_recent() {
+  const res = await tool_fetch_handbook();
+  if (typeof res?.body === 'string') {
+    try {
+      const parsed = JSON.parse(res.body);
+      return { status: res.status, recent_inbox: parsed.recent_inbox ?? [], source: 'handbook' };
+    } catch {
+      return { status: res.status, body: res.body, source: 'handbook_raw', note: 'Handbook was not parseable as JSON; returning raw handbook body.' };
+    }
+  }
+  return res;
+}
+
 async function tool_delegate_to_dept({ dept, task, priority = 'normal', payload = {} }) {
   try {
     const r = await fetchT(`${CK_BASE}?action=delegate`, {
@@ -398,6 +452,13 @@ const TOOL_HANDLERS = {
   telegram_send: tool_telegram_send,
   propose_action: tool_propose_action,
   fetch_handbook: tool_fetch_handbook,
+  finance_status: tool_finance_status,
+  waba_status: tool_waba_status,
+  sender_status: tool_sender_status,
+  recovery_status: tool_recovery_status,
+  director_status: tool_director_status,
+  audit_reports: tool_audit_reports,
+  dept_inbox_recent: tool_dept_inbox_recent,
   delegate_to_dept: tool_delegate_to_dept,
 };
 
