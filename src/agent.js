@@ -66,6 +66,13 @@ The handbook contains: every department, every n8n workflow with current status,
 
 If you do not have a dedicated tool for a question, do NOT say 'the system does not exist' or 'I cannot see X.' Instead, say 'I do not have a dedicated tool for this, but I can query indirectly via crownkey_api or fetch_handbook.' Then actually call the closest read-only endpoint and report what you find. Never convert 'no named tool' into 'the system does not exist.' If after querying you still cannot find data, say 'I queried [endpoint] and the data was not present' — do not fabricate values.
 
+For verifying claims about system events (briefings, alerts, what specific departments did), use read_dept_inbox with appropriate filters. Examples:
+- User asks 'verify the WABA throttle briefing' → call read_dept_inbox(dept='finance', category='waba', since_hours=4)
+- User asks 'what did Audit find today' → call read_dept_inbox(dept='audit', severity='critical', since_hours=24)
+- User asks 'show me unread alerts' → call read_dept_inbox(unread_only=true, severity='warning', limit=20)
+
+Don't say 'I cannot verify' for dept_inbox claims anymore — call this tool first.
+
 === FRAMEWORK V1 — adopted 2026-05-06 (supersedes the legacy outreach engine) ===
 
 OUTREACH PIPELINE — single entry point ?action=outreach-pipeline
@@ -195,6 +202,7 @@ const TOOLS = [
   { name: 'director_status', description: 'Read-only Campaign Director status. Use for tomorrow/current planned campaign, Director pick, planned volume, image URL, CTA buttons, rationale, last_issued_at, and whether the pick may be stale. Returns only framework-status.departments.campaign_director.', input_schema: { type: 'object', properties: {} } },
   { name: 'audit_reports', description: 'Read-only recent Audit Department reports. Use for last audit findings, critical/warning counts, audit summaries, and recent audit history. Wraps crownkey_api action=audits; optional limit defaults to 5.', input_schema: { type: 'object', properties: { limit: { type: 'integer', description: 'Number of recent audit reports to return, default 5, max enforced by backend.' } } } },
   { name: 'dept_inbox_recent', description: 'Read-only recent department inbox events. Use for last dept_inbox events, latest PA/department alerts, or when no dedicated department tool has enough detail. For now this wraps fetch_handbook and returns its recent_inbox section when available; dedicated filtering endpoint is deferred.', input_schema: { type: 'object', properties: {} } },
+  { name: 'read_dept_inbox', description: "Read recent events from dept_inbox. Use when verifying briefing claims, checking what specific departments have logged, or investigating recent system activity. Filters: dept (department name), severity (info/warning/critical), category, since_hours (default 24), unread_only (default false), limit (default 20, max 100). Returns events with timestamps, payloads, and read status. This is the primary tool for answering 'did X actually happen' questions about the system.", input_schema: { type: 'object', properties: { dept: { type: 'string', description: "Optional department filter, e.g. finance, sales, diagnostic, audit, hr, pa, recovery, director." }, severity: { type: 'string', description: 'Optional severity filter, e.g. info, warning, critical.' }, category: { type: 'string', description: 'Optional category substring filter.' }, since_hours: { type: 'integer', description: 'Only events from the last N hours, default 24.' }, unread_only: { type: 'boolean', description: 'Only events where read_at is null, default false.' }, limit: { type: 'integer', description: 'Max events to return, default 20, capped at 100.' } } } },
   { name: 'delegate_to_dept', description: 'Delegate a task to a specific department. The dept reads its task queue on its next tick and executes. Use this instead of doing the work yourself when an existing dept owns the responsibility. Framework v1 depts (meta_health, campaign_director, data_control, watchdog, campaign_dept, data_specialist) are reachable too — but in practice they run as inline phases of the outreach pipeline; for one-off framework calls prefer crownkey_api with action=outreach-pipeline / ceo-campaign / framework-status.', input_schema: { type: 'object', properties: { dept: { type: 'string', enum: ['finance','sales','diagnostic','watchdog','hr','campaign','crm_bridge','reply_enricher','meta_health','campaign_director','data_control','campaign_dept','data_specialist'] }, task: { type: 'string', description: 'Imperative description, like \"investigate sender X failure rate\"' }, priority: { type: 'string', enum: ['low','normal','high'] }, payload: { type: 'object', description: 'Optional structured args' } }, required: ['dept', 'task'] } },
 ];
 
@@ -426,6 +434,34 @@ async function tool_dept_inbox_recent() {
   return res;
 }
 
+async function tool_read_dept_inbox({
+  dept,
+  severity,
+  category,
+  since_hours = 24,
+  unread_only = false,
+  limit = 20,
+} = {}) {
+  const params = {};
+  const clean = (v, max = 96) => String(v || '').trim().slice(0, max);
+  const deptValue = clean(dept, 64).toLowerCase();
+  const severityValue = clean(severity, 32).toLowerCase();
+  const categoryValue = clean(category, 96);
+  const sinceHoursValue = Math.max(1, Math.min(24 * 30, Number.parseInt(since_hours, 10) || 24));
+  const limitValue = Math.max(1, Math.min(100, Number.parseInt(limit, 10) || 20));
+
+  if (deptValue) params.dept = deptValue;
+  if (severityValue) params.severity = severityValue;
+  if (categoryValue) params.category = categoryValue;
+  params.since_hours = String(sinceHoursValue);
+  params.limit = String(limitValue);
+  if (unread_only === true || unread_only === 'true' || unread_only === 1 || unread_only === '1') {
+    params.unread_only = 'true';
+  }
+
+  return tool_crownkey_api({ action: 'dept-inbox', params });
+}
+
 async function tool_delegate_to_dept({ dept, task, priority = 'normal', payload = {} }) {
   try {
     const r = await fetchT(`${CK_BASE}?action=delegate`, {
@@ -459,6 +495,7 @@ const TOOL_HANDLERS = {
   director_status: tool_director_status,
   audit_reports: tool_audit_reports,
   dept_inbox_recent: tool_dept_inbox_recent,
+  read_dept_inbox: tool_read_dept_inbox,
   delegate_to_dept: tool_delegate_to_dept,
 };
 
