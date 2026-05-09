@@ -219,6 +219,9 @@ const TOOLS = [
   { name: 'sender_disable', description: 'Sender Control write tool. Disables a WhatsApp sender by phone_number_id with a required reason. dry_run=true previews current delivery/fail stats, last-24h volume, and whether disabling would leave at least one active sender. dry_run=false returns a confirmation token; it does not execute until confirm_commander_action is called. Logs to dept_inbox after execution.', input_schema: { type: 'object', properties: { sender_id: { type: 'string' }, reason: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['sender_id', 'reason'] } },
   { name: 'sender_enable', description: 'Sender Control write tool. Re-enables a manually disabled WhatsApp sender after backend reputation checks using sender-health/Meta Health. dry_run=true previews reputation and whether the sender is safe to enable. dry_run=false returns a confirmation token; it does not execute until confirm_commander_action is called. Logs to dept_inbox after execution.', input_schema: { type: 'object', properties: { sender_id: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['sender_id'] } },
   { name: 'sender_rotate', description: 'Sender Control write tool. Rotates the sender pool by disabling the weakest active sender and, when available, enabling the best disabled healthy sender as replacement. dry_run=true reports which sender will be deactivated and which will become active. dry_run=false returns a confirmation token; it does not execute until confirm_commander_action is called. Never leaves the system with zero active senders.', input_schema: { type: 'object', properties: { dry_run: { type: 'boolean' } } } },
+  { name: 'director_skip', description: 'Director/Gate Control write tool. Skips a template for the current/future Director run. dry_run=true previews the 7-day skip, current decision state, and which next template Director would likely pick instead. dry_run=false returns a confirmation token; execution logs to dept_inbox.', input_schema: { type: 'object', properties: { template_name: { type: 'string' }, reason: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['template_name', 'reason'] } },
+  { name: 'director_approve_pending', description: 'Director/Gate Control write tool. Approves every currently pending Director gate decision. dry_run=true lists all pending templates before approval. dry_run=false returns a confirmation token; execution logs each approved template to dept_inbox.', input_schema: { type: 'object', properties: { dry_run: { type: 'boolean' } } } },
+  { name: 'director_set_threshold', description: 'Director/Gate Control write tool. Sets Director failure-rate gate threshold as a percent. Backend enforces sane bounds: minimum 10, maximum 60. dry_run=true previews old and new values. dry_run=false returns a confirmation token; execution logs old and new threshold to dept_inbox.', input_schema: { type: 'object', properties: { percent: { type: 'number' }, dry_run: { type: 'boolean' } }, required: ['percent'] } },
   { name: 'delegate_to_dept', description: 'Delegate a task to a specific department. The dept reads its task queue on its next tick and executes. Use this instead of doing the work yourself when an existing dept owns the responsibility. Framework v1 depts (meta_health, campaign_director, data_control, watchdog, campaign_dept, data_specialist) are reachable too — but in practice they run as inline phases of the outreach pipeline; for one-off framework calls prefer crownkey_api with action=outreach-pipeline / ceo-campaign / framework-status.', input_schema: { type: 'object', properties: { dept: { type: 'string', enum: ['finance','sales','diagnostic','watchdog','hr','campaign','crm_bridge','reply_enricher','meta_health','campaign_director','data_control','campaign_dept','data_specialist'] }, task: { type: 'string', description: 'Imperative description, like \"investigate sender X failure rate\"' }, priority: { type: 'string', enum: ['low','normal','high'] }, payload: { type: 'object', description: 'Optional structured args' } }, required: ['dept', 'task'] } },
 ];
 
@@ -689,6 +692,58 @@ async function tool_sender_rotate({ dry_run = true } = {}) {
   });
 }
 
+function directorControlDryRunBody(op, input = {}) {
+  return { ...input, op, dry_run: true };
+}
+
+async function tool_director_skip({ template_name, reason, dry_run = true } = {}) {
+  const body = { op: 'director_skip', template_name, reason };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-director-control', method: 'POST', body: directorControlDryRunBody('director_skip', body) });
+  }
+  const preview = await tool_crownkey_api({ action: 'atlas-director-control', method: 'POST', body: directorControlDryRunBody('director_skip', body) });
+  if (preview?.ok === false) return preview;
+  return queueCommanderAction({
+    tool: 'director_skip',
+    summary: `Skip Director template ${template_name} for 7 days. Reason: ${reason}`,
+    action: 'atlas-director-control',
+    body,
+    preview,
+  });
+}
+
+async function tool_director_approve_pending({ dry_run = true } = {}) {
+  const body = { op: 'director_approve_pending' };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-director-control', method: 'POST', body: directorControlDryRunBody('director_approve_pending', body) });
+  }
+  const preview = await tool_crownkey_api({ action: 'atlas-director-control', method: 'POST', body: directorControlDryRunBody('director_approve_pending', body) });
+  if (preview?.ok === false) return preview;
+  return queueCommanderAction({
+    tool: 'director_approve_pending',
+    summary: `Approve ${preview?.pending?.length ?? 0} pending Director gate decision(s).`,
+    action: 'atlas-director-control',
+    body,
+    preview,
+  });
+}
+
+async function tool_director_set_threshold({ percent, dry_run = true } = {}) {
+  const body = { op: 'director_set_threshold', percent };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-director-control', method: 'POST', body: directorControlDryRunBody('director_set_threshold', body) });
+  }
+  const preview = await tool_crownkey_api({ action: 'atlas-director-control', method: 'POST', body: directorControlDryRunBody('director_set_threshold', body) });
+  if (preview?.ok === false) return preview;
+  return queueCommanderAction({
+    tool: 'director_set_threshold',
+    summary: `Set Director failure threshold from ${preview?.old_percent ?? '?'}% to ${preview?.new_percent ?? percent}%.`,
+    action: 'atlas-director-control',
+    body,
+    preview,
+  });
+}
+
 async function tool_delegate_to_dept({ dept, task, priority = 'normal', payload = {} }) {
   try {
     const r = await fetchT(`${CK_BASE}?action=delegate`, {
@@ -735,6 +790,9 @@ const TOOL_HANDLERS = {
   sender_disable: tool_sender_disable,
   sender_enable: tool_sender_enable,
   sender_rotate: tool_sender_rotate,
+  director_skip: tool_director_skip,
+  director_approve_pending: tool_director_approve_pending,
+  director_set_threshold: tool_director_set_threshold,
   delegate_to_dept: tool_delegate_to_dept,
 };
 
