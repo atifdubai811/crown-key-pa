@@ -54,6 +54,8 @@ const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '6501185066';
 
 const CK_BASE = 'https://crownkey.online/n8n-stats.php';
 const ckHeaders = () => ({ Authorization: `Bearer ${CK_TOKEN}` });
+const COMMANDER_TOKEN_TTL_MS = 10 * 60 * 1000;
+const pendingCommanderActions = new Map();
 
 const SYSTEM = `You are Atlas — Atif's autonomous AI co-pilot for Crown Key Real Estate Dubai. He's the founder. You're his thinking partner with full agentic control over the system.
 
@@ -172,7 +174,7 @@ WHO YOU TALK TO: Atif (CEO/founder). Telegram chat 6501185066. WhatsApp 97155899
 OPERATING RULES:
 1. ALWAYS fetch the handbook before answering structural questions. NEVER claim a department doesn't exist without checking.
 2. READ-ONLY ops: do them freely.
-3. WRITE/DESTRUCTIVE in production: propose_action first with approve/reject buttons.
+3. WRITE/DESTRUCTIVE in production: use Commander tools only through their confirmation pattern. First call the tool without confirm_token; it returns a short token and dry-run/preview. Tell Atif exactly what will happen and ask him to reply "confirm TOKEN". If Atif replies "confirm TOKEN" or a clear "yes" immediately after the proposal, call confirm_commander_action with that token. Never execute a write from memory or by generic crownkey_api unless the specific Commander tool is missing and Atif explicitly approves.
 4. DELEGATE rather than do-it-yourself when an existing dept owns the task. Use POST to /n8n-stats.php?action=delegate with {dept, task, priority, payload}. Then tell Atif "I asked X dept to handle that, they'll report back via PA digest."
 5. CEO Command: when Atif says "run a campaign on city walk for buyers", call ?action=ceo-campaign with audience_filter. Handle need_input responses by asking him for the image/template name.
 6. Be conversational, not robotic. Use contractions. Vary sentence length. Don't read out lists — synthesize. NEVER use markdown asterisks (Telegram entity parser breaks on phones).
@@ -205,6 +207,12 @@ const TOOLS = [
   { name: 'audit_reports', description: 'Read-only recent Audit Department reports. Use for last audit findings, critical/warning counts, audit summaries, and recent audit history. Wraps crownkey_api action=audits; optional limit defaults to 5.', input_schema: { type: 'object', properties: { limit: { type: 'integer', description: 'Number of recent audit reports to return, default 5, max enforced by backend.' } } } },
   { name: 'dept_inbox_recent', description: 'Read-only recent department inbox events. Use for last dept_inbox events, latest PA/department alerts, or when no dedicated department tool has enough detail. For now this wraps fetch_handbook and returns its recent_inbox section when available; dedicated filtering endpoint is deferred.', input_schema: { type: 'object', properties: {} } },
   { name: 'read_dept_inbox', description: "Read recent events from dept_inbox. Use when verifying briefing claims, checking what specific departments have logged, or investigating recent system activity. Filters: dept (department name), severity (info/warning/critical), category, since_hours (default 24), unread_only (default false), limit (default 20, max 100). Returns events with timestamps, payloads, and read status. This is the primary tool for answering 'did X actually happen' questions about the system. IMPORTANT — for workflow names or system component names (e.g., 'CRM Bridge', 'Outreach Pipeline', 'Recovery Department'), DO NOT pass them as dept= filter. The dept column contains department names like 'finance', 'sales', 'audit', 'diagnostic', 'watchdog_army', 'pa', 'hr'. Workflow events are logged BY these departments. For workflow searches: 1. First try without dept filter, search by category or keyword 2. If looking for workflow health, try dept=diagnostic or dept=watchdog_army 3. If zero results with dept= filter, retry without it before concluding 'not found'", input_schema: { type: 'object', properties: { dept: { type: 'string', description: "Optional department filter, e.g. finance, sales, diagnostic, audit, hr, pa, recovery, director." }, severity: { type: 'string', description: 'Optional severity filter, e.g. info, warning, critical.' }, category: { type: 'string', description: 'Optional category substring filter.' }, since_hours: { type: 'integer', description: 'Only events from the last N hours, default 24.' }, unread_only: { type: 'boolean', description: 'Only events where read_at is null, default false.' }, limit: { type: 'integer', description: 'Max events to return, default 20, capped at 100.' } } } },
+  { name: 'confirm_commander_action', description: 'Execute a previously proposed Commander write action after Atif replies "confirm TOKEN" or an immediate clear yes. Required for all production writes. Tokens expire after 10 minutes.', input_schema: { type: 'object', properties: { token: { type: 'string', description: 'Confirmation token returned by a Commander tool.' } }, required: ['token'] } },
+  { name: 'launch_campaign', description: 'Campaign Control write tool. Manually launch the outreach pipeline with a specified template and optional audience_filter. dry_run=true previews only. dry_run=false returns a confirmation token; it does not execute until confirm_commander_action is called. Respects Meta Health/Data Control/Watchdog when executed.', input_schema: { type: 'object', properties: { template_name: { type: 'string' }, audience_filter: { type: 'object', description: 'Optional filters, e.g. {area, role, source}.' }, volume_override: { type: 'integer' }, dry_run: { type: 'boolean', description: 'Preview without executing. Default true for safety.' } }, required: ['template_name'] } },
+  { name: 'pause_campaign', description: 'Campaign Control write tool. Pause one WhatsApp campaign by numeric campaign_id and pause active queued rows. Returns a confirmation token unless dry_run=true. Logs to dept_inbox after execution.', input_schema: { type: 'object', properties: { campaign_id: { type: 'integer' }, reason: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['campaign_id'] } },
+  { name: 'resume_campaign', description: 'Campaign Control write tool. Resume a paused campaign by campaign_id after backend WABA/sender health checks. Returns a confirmation token unless dry_run=true. Logs to dept_inbox after execution.', input_schema: { type: 'object', properties: { campaign_id: { type: 'integer' }, dry_run: { type: 'boolean' } }, required: ['campaign_id'] } },
+  { name: 'rotate_template', description: 'Campaign Control write tool. Influences the next Director pick by setting old_template skipped and new_template approved. This does not rewrite a stored schedule row; Director/Meta/Data gates still apply. Returns a confirmation token unless dry_run=true.', input_schema: { type: 'object', properties: { old_template: { type: 'string' }, new_template: { type: 'string' }, reason: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['old_template', 'new_template'] } },
+  { name: 'trigger_template_preview', description: 'Campaign Control write tool. Runs template_preview.php on demand for tomorrow/current planned pick. Returns a confirmation token unless dry_run=true.', input_schema: { type: 'object', properties: { dry_run: { type: 'boolean' } } } },
   { name: 'delegate_to_dept', description: 'Delegate a task to a specific department. The dept reads its task queue on its next tick and executes. Use this instead of doing the work yourself when an existing dept owns the responsibility. Framework v1 depts (meta_health, campaign_director, data_control, watchdog, campaign_dept, data_specialist) are reachable too — but in practice they run as inline phases of the outreach pipeline; for one-off framework calls prefer crownkey_api with action=outreach-pipeline / ceo-campaign / framework-status.', input_schema: { type: 'object', properties: { dept: { type: 'string', enum: ['finance','sales','diagnostic','watchdog','hr','campaign','crm_bridge','reply_enricher','meta_health','campaign_director','data_control','campaign_dept','data_specialist'] }, task: { type: 'string', description: 'Imperative description, like \"investigate sender X failure rate\"' }, priority: { type: 'string', enum: ['low','normal','high'] }, payload: { type: 'object', description: 'Optional structured args' } }, required: ['dept', 'task'] } },
 ];
 
@@ -464,6 +472,118 @@ async function tool_read_dept_inbox({
   return tool_crownkey_api({ action: 'dept-inbox', params });
 }
 
+function cleanupCommanderActions() {
+  const now = Date.now();
+  for (const [token, item] of pendingCommanderActions.entries()) {
+    if (!item?.expires_at || item.expires_at <= now) pendingCommanderActions.delete(token);
+  }
+}
+
+function makeCommanderToken() {
+  return `CK${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+}
+
+function queueCommanderAction({ tool, summary, body }) {
+  cleanupCommanderActions();
+  const token = makeCommanderToken();
+  pendingCommanderActions.set(token, {
+    tool,
+    summary,
+    action: 'atlas-campaign-control',
+    body,
+    created_at: Date.now(),
+    expires_at: Date.now() + COMMANDER_TOKEN_TTL_MS,
+  });
+  return {
+    ok: true,
+    confirmation_required: true,
+    token,
+    expires_in_minutes: 10,
+    summary,
+    next_step: `Ask Atif to reply: confirm ${token}`,
+    dry_run_available: true,
+  };
+}
+
+async function tool_confirm_commander_action({ token }) {
+  cleanupCommanderActions();
+  const cleanToken = String(token || '').trim().toUpperCase();
+  const pending = pendingCommanderActions.get(cleanToken);
+  if (!pending) {
+    return { ok: false, error: 'confirmation_token_not_found_or_expired', token: cleanToken };
+  }
+  pendingCommanderActions.delete(cleanToken);
+  return tool_crownkey_api({
+    action: pending.action,
+    method: 'POST',
+    body: { ...pending.body, dry_run: false, confirmed_token: cleanToken, actor: 'atif', source: 'atlas_command' },
+  });
+}
+
+function campaignControlDryRunBody(op, input = {}) {
+  return { ...input, op, dry_run: true };
+}
+
+async function tool_launch_campaign({ template_name, audience_filter, volume_override, dry_run = true } = {}) {
+  const body = { op: 'launch_campaign', template_name, audience_filter, volume_override };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-campaign-control', method: 'POST', body: campaignControlDryRunBody('launch_campaign', body) });
+  }
+  return queueCommanderAction({
+    tool: 'launch_campaign',
+    summary: `Launch outreach pipeline with template "${template_name}"${audience_filter ? ` for ${JSON.stringify(audience_filter)}` : ''}.`,
+    body,
+  });
+}
+
+async function tool_pause_campaign({ campaign_id, reason = 'manual Atlas pause', dry_run = true } = {}) {
+  const body = { op: 'pause_campaign', campaign_id, reason };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-campaign-control', method: 'POST', body: campaignControlDryRunBody('pause_campaign', body) });
+  }
+  return queueCommanderAction({
+    tool: 'pause_campaign',
+    summary: `Pause campaign #${campaign_id}. Reason: ${reason}`,
+    body,
+  });
+}
+
+async function tool_resume_campaign({ campaign_id, dry_run = true } = {}) {
+  const body = { op: 'resume_campaign', campaign_id };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-campaign-control', method: 'POST', body: campaignControlDryRunBody('resume_campaign', body) });
+  }
+  return queueCommanderAction({
+    tool: 'resume_campaign',
+    summary: `Resume campaign #${campaign_id} after WABA and sender health checks.`,
+    body,
+  });
+}
+
+async function tool_rotate_template({ old_template, new_template, reason = 'manual Atlas rotation', dry_run = true } = {}) {
+  const body = { op: 'rotate_template', old_template, new_template, reason };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-campaign-control', method: 'POST', body: campaignControlDryRunBody('rotate_template', body) });
+  }
+  return queueCommanderAction({
+    tool: 'rotate_template',
+    summary: `Influence Director rotation: skip "${old_template}" and approve "${new_template}". Reason: ${reason}`,
+    body,
+  });
+}
+
+async function tool_trigger_template_preview({ dry_run = true } = {}) {
+  const body = { op: 'trigger_template_preview' };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-campaign-control', method: 'POST', body: campaignControlDryRunBody('trigger_template_preview', body) });
+  }
+  return queueCommanderAction({
+    tool: 'trigger_template_preview',
+    summary: 'Run Template Preview on demand for the current/tomorrow planned pick.',
+    body,
+  });
+}
+
 async function tool_delegate_to_dept({ dept, task, priority = 'normal', payload = {} }) {
   try {
     const r = await fetchT(`${CK_BASE}?action=delegate`, {
@@ -498,6 +618,12 @@ const TOOL_HANDLERS = {
   audit_reports: tool_audit_reports,
   dept_inbox_recent: tool_dept_inbox_recent,
   read_dept_inbox: tool_read_dept_inbox,
+  confirm_commander_action: tool_confirm_commander_action,
+  launch_campaign: tool_launch_campaign,
+  pause_campaign: tool_pause_campaign,
+  resume_campaign: tool_resume_campaign,
+  rotate_template: tool_rotate_template,
+  trigger_template_preview: tool_trigger_template_preview,
   delegate_to_dept: tool_delegate_to_dept,
 };
 
