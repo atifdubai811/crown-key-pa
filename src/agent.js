@@ -216,6 +216,9 @@ const TOOLS = [
   { name: 'recovery_pause', description: 'Recovery Control write tool. Pauses Recovery by setting the recovery kill switch with a required reason. dry_run=true previews current pause state only. dry_run=false returns a confirmation token; it does not execute until confirm_commander_action is called. Logs to dept_inbox after execution.', input_schema: { type: 'object', properties: { reason: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['reason'] } },
   { name: 'recovery_resume', description: 'Recovery Control write tool. Resumes Recovery by clearing the recovery kill switch after backend WABA health verification. dry_run=true previews current pause state and WABA status. dry_run=false returns a confirmation token; it does not execute until confirm_commander_action is called. Logs to dept_inbox after execution.', input_schema: { type: 'object', properties: { dry_run: { type: 'boolean' } } } },
   { name: 'recovery_drain', description: 'Recovery Control write tool. Manually triggers Recovery to drain failed contacts. Must verify WABA OK and respect daily_send_ceiling before execution. dry_run=true returns candidate batches and contact_ids that would be drained. dry_run=false returns a confirmation token; limits over 100 are high-risk and must be explicitly confirmed before execution. Logs to dept_inbox after execution.', input_schema: { type: 'object', properties: { limit: { type: 'integer', description: 'Optional max contacts to drain. Backend caps this at daily_send_ceiling.' }, dry_run: { type: 'boolean' } } } },
+  { name: 'sender_disable', description: 'Sender Control write tool. Disables a WhatsApp sender by phone_number_id with a required reason. dry_run=true previews current delivery/fail stats, last-24h volume, and whether disabling would leave at least one active sender. dry_run=false returns a confirmation token; it does not execute until confirm_commander_action is called. Logs to dept_inbox after execution.', input_schema: { type: 'object', properties: { sender_id: { type: 'string' }, reason: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['sender_id', 'reason'] } },
+  { name: 'sender_enable', description: 'Sender Control write tool. Re-enables a manually disabled WhatsApp sender after backend reputation checks using sender-health/Meta Health. dry_run=true previews reputation and whether the sender is safe to enable. dry_run=false returns a confirmation token; it does not execute until confirm_commander_action is called. Logs to dept_inbox after execution.', input_schema: { type: 'object', properties: { sender_id: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['sender_id'] } },
+  { name: 'sender_rotate', description: 'Sender Control write tool. Rotates the sender pool by disabling the weakest active sender and, when available, enabling the best disabled healthy sender as replacement. dry_run=true reports which sender will be deactivated and which will become active. dry_run=false returns a confirmation token; it does not execute until confirm_commander_action is called. Never leaves the system with zero active senders.', input_schema: { type: 'object', properties: { dry_run: { type: 'boolean' } } } },
   { name: 'delegate_to_dept', description: 'Delegate a task to a specific department. The dept reads its task queue on its next tick and executes. Use this instead of doing the work yourself when an existing dept owns the responsibility. Framework v1 depts (meta_health, campaign_director, data_control, watchdog, campaign_dept, data_specialist) are reachable too — but in practice they run as inline phases of the outreach pipeline; for one-off framework calls prefer crownkey_api with action=outreach-pipeline / ceo-campaign / framework-status.', input_schema: { type: 'object', properties: { dept: { type: 'string', enum: ['finance','sales','diagnostic','watchdog','hr','campaign','crm_bridge','reply_enricher','meta_health','campaign_director','data_control','campaign_dept','data_specialist'] }, task: { type: 'string', description: 'Imperative description, like \"investigate sender X failure rate\"' }, priority: { type: 'string', enum: ['low','normal','high'] }, payload: { type: 'object', description: 'Optional structured args' } }, required: ['dept', 'task'] } },
 ];
 
@@ -486,7 +489,7 @@ function makeCommanderToken() {
   return `CK${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
 }
 
-function queueCommanderAction({ tool, summary, body, action = 'atlas-campaign-control' }) {
+function queueCommanderAction({ tool, summary, body, action = 'atlas-campaign-control', preview = null }) {
   cleanupCommanderActions();
   const token = makeCommanderToken();
   pendingCommanderActions.set(token, {
@@ -505,6 +508,7 @@ function queueCommanderAction({ tool, summary, body, action = 'atlas-campaign-co
     summary,
     next_step: `Ask Atif to reply: confirm ${token}`,
     dry_run_available: true,
+    preview,
   };
 }
 
@@ -631,6 +635,60 @@ async function tool_recovery_drain({ limit, dry_run = true } = {}) {
   });
 }
 
+function senderControlDryRunBody(op, input = {}) {
+  return { ...input, op, dry_run: true };
+}
+
+async function tool_sender_disable({ sender_id, reason, dry_run = true } = {}) {
+  const body = { op: 'sender_disable', sender_id, reason };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-sender-control', method: 'POST', body: senderControlDryRunBody('sender_disable', body) });
+  }
+  const preview = await tool_crownkey_api({ action: 'atlas-sender-control', method: 'POST', body: senderControlDryRunBody('sender_disable', body) });
+  if (preview?.ok === false) return preview;
+  return queueCommanderAction({
+    tool: 'sender_disable',
+    summary: `Disable WhatsApp sender ${sender_id}. Reason: ${reason}`,
+    action: 'atlas-sender-control',
+    body,
+    preview,
+  });
+}
+
+async function tool_sender_enable({ sender_id, dry_run = true } = {}) {
+  const body = { op: 'sender_enable', sender_id };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-sender-control', method: 'POST', body: senderControlDryRunBody('sender_enable', body) });
+  }
+  const preview = await tool_crownkey_api({ action: 'atlas-sender-control', method: 'POST', body: senderControlDryRunBody('sender_enable', body) });
+  if (preview?.ok === false) return preview;
+  return queueCommanderAction({
+    tool: 'sender_enable',
+    summary: `Re-enable WhatsApp sender ${sender_id} after backend reputation checks.`,
+    action: 'atlas-sender-control',
+    body,
+    preview,
+  });
+}
+
+async function tool_sender_rotate({ dry_run = true } = {}) {
+  const body = { op: 'sender_rotate' };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-sender-control', method: 'POST', body: senderControlDryRunBody('sender_rotate', body) });
+  }
+  const preview = await tool_crownkey_api({ action: 'atlas-sender-control', method: 'POST', body: senderControlDryRunBody('sender_rotate', body) });
+  if (preview?.ok === false) return preview;
+  const deact = preview?.preview?.deactivate_sender || 'unknown';
+  const act = preview?.preview?.activate_sender || 'no replacement';
+  return queueCommanderAction({
+    tool: 'sender_rotate',
+    summary: `Rotate sender pool: disable ${deact}; activate ${act}.`,
+    action: 'atlas-sender-control',
+    body,
+    preview,
+  });
+}
+
 async function tool_delegate_to_dept({ dept, task, priority = 'normal', payload = {} }) {
   try {
     const r = await fetchT(`${CK_BASE}?action=delegate`, {
@@ -674,6 +732,9 @@ const TOOL_HANDLERS = {
   recovery_pause: tool_recovery_pause,
   recovery_resume: tool_recovery_resume,
   recovery_drain: tool_recovery_drain,
+  sender_disable: tool_sender_disable,
+  sender_enable: tool_sender_enable,
+  sender_rotate: tool_sender_rotate,
   delegate_to_dept: tool_delegate_to_dept,
 };
 
