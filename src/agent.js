@@ -300,6 +300,11 @@ const TOOLS = [
   { name: 'contact_blacklist', description: 'Contact/Data Ops write tool. Blacklists one phone so future outreach is prevented across all campaigns. Writes system_signals.contact_blacklisted:<phone>, sets contacts.wa_blocked_at so the existing Watchdog R4 rule blocks future sends with no other code changes, and cancels active queued rows (status 1 or 4 → 99 cancelled). Backend rejects protected phones (Atif and known sender phone_number_ids). dry_run=true previews. dry_run=false returns a confirmation token; execution logs to dept_inbox. Reversible via contact_whitelist.', input_schema: { type: 'object', properties: { phone: { type: 'string' }, reason: { type: 'string', description: 'Required short reason — surfaces in dept_inbox and the signal set_by field.' }, dry_run: { type: 'boolean' } }, required: ['phone', 'reason'] } },
   { name: 'contact_whitelist', description: 'Contact/Data Ops write tool. Removes one phone from the blacklist by deleting the contact_blacklisted:<phone> signal and clearing contacts.wa_blocked_at if it was set. Use this to reverse a previous blacklist. dry_run=true previews. dry_run=false returns a confirmation token; execution logs to dept_inbox.', input_schema: { type: 'object', properties: { phone: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['phone'] } },
   { name: 'bulk_blacklist_from_filter', description: 'Contact/Data Ops write tool. Blacklists multiple phones matching a filter. Filter types: {type:"replied_stop", since_days?} catches contacts whose latest inbound text was STOP/UNSUBSCRIBE/REMOVE ME/NO. {type:"failed_with_code", code, since_days?} catches contacts whose outbound failed with a specific Meta error code (e.g. 131026, 130472). HARD CAP 500 — backend rejects with HTTP 400 if filter matches more, asking user to narrow scope. Protected phones (Atif, sender ids) are stripped automatically. dry_run=true returns matched_count + first 10 sample phones. dry_run=false returns a confirmation token; over-100 matches are flagged HIGH RISK in the summary. Logs total to dept_inbox.', input_schema: { type: 'object', properties: { filter: { type: 'object', description: 'Filter specification.', properties: { type: { type: 'string', enum: ['replied_stop','failed_with_code'] }, code: { type: 'integer' }, since_days: { type: 'integer' } }, required: ['type'] }, reason: { type: 'string', description: 'Required short reason.' }, dry_run: { type: 'boolean' } }, required: ['filter', 'reason'] } },
+  { name: 'pause_dept', description: 'System Control write tool. Pauses one cron-driven department by writing system_signals.dept_paused:<name>=1 with reason. Allowed dept names: finance, sales, diagnostic, audit, hr, lead_watchdog, watchdog_army, crm_bridge, reply_intel, reply_enricher. Recovery has its own dedicated recovery_pause tool — pause_dept REJECTS dept_name=recovery with HTTP 400. NOTE: This signal is forward-looking — depts must check it on tick start to honor the pause; depts that do not yet check will be wired up in a follow-up. Until then the signal is the audit-trail source of truth. dry_run=true previews current dept status (live n8n active flag, last update, existing signal). dry_run=false returns a confirmation token. Logs to dept_inbox.', input_schema: { type: 'object', properties: { dept_name: { type: 'string', description: 'Department name (lowercase).' }, reason: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['dept_name', 'reason'] } },
+  { name: 'resume_dept', description: 'System Control write tool. Resumes a paused department by deleting system_signals.dept_paused:<name>. Same allowed names as pause_dept. Recovery has its own recovery_resume tool. dry_run=true previews current pause state. dry_run=false returns a confirmation token. Logs to dept_inbox.', input_schema: { type: 'object', properties: { dept_name: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['dept_name'] } },
+  { name: 'system_freeze', description: 'System Control write tool. HARD STOP — pauses ALL outreach activity by writing system_signals.global_freeze=1 with reason. Daily 06:00 cron, Recovery, CEO commands all gated by this signal. ALWAYS allowed regardless of WABA state (freezing is the safe action). dry_run=true returns full blast radius: count and sample of active campaigns, queued contacts, today\'s sent count, daily cap, remaining cap, active sender info, current freeze state. dry_run=false returns a confirmation token; HIGH RISK is flagged in the summary. Reversible via system_unfreeze (which re-checks WABA before clearing).', input_schema: { type: 'object', properties: { reason: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['reason'] } },
+  { name: 'system_unfreeze', description: 'System Control write tool. Clears the global_freeze signal so outreach resumes. Re-checks WABA hourly fail rate before clearing — if fail rate > 50% (critical) the unfreeze is REJECTED with HTTP 400 to avoid releasing the brake while sends are bleeding. dry_run=true previews current freeze state and computed WABA level. dry_run=false returns a confirmation token. Logs to dept_inbox.', input_schema: { type: 'object', properties: { dry_run: { type: 'boolean' } } } },
+  { name: 'emergency_stop_all_campaigns', description: 'System Control write tool. NUCLEAR — pauses every active campaign in one operation (campaigns.status IN (1,2,5) → 4, plus their queued whatsapp_message_queue rows IN (1,2,5) → 4). HARD CAP 20: if more than 20 active campaigns exist the backend rejects with HTTP 400 (an unusually high count signals runaway state requiring per-campaign investigation, not a sweep). dry_run=true lists EVERY active campaign by id/title/template/queue size so Atif sees the full impact. dry_run=false returns a confirmation token; HIGHEST RISK in the summary. Logs ONE dept_inbox event with full campaign list. Reversible per-campaign via resume_campaign.', input_schema: { type: 'object', properties: { reason: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['reason'] } },
   { name: 'delegate_to_dept', description: 'Delegate a task to a specific department. The dept reads its task queue on its next tick and executes. Use this instead of doing the work yourself when an existing dept owns the responsibility. Framework v1 depts (meta_health, campaign_director, data_control, watchdog, campaign_dept, data_specialist) are reachable too — but in practice they run as inline phases of the outreach pipeline; for one-off framework calls prefer crownkey_api with action=outreach-pipeline / ceo-campaign / framework-status.', input_schema: { type: 'object', properties: { dept: { type: 'string', enum: ['finance','sales','diagnostic','watchdog','hr','campaign','crm_bridge','reply_enricher','meta_health','campaign_director','data_control','campaign_dept','data_specialist'] }, task: { type: 'string', description: 'Imperative description, like \"investigate sender X failure rate\"' }, priority: { type: 'string', enum: ['low','normal','high'] }, payload: { type: 'object', description: 'Optional structured args' } }, required: ['dept', 'task'] } },
 ];
 
@@ -883,6 +888,93 @@ async function tool_bulk_blacklist_from_filter({ filter, reason, dry_run = true 
   });
 }
 
+function systemControlDryRunBody(op, input = {}) {
+  return { ...input, op, dry_run: true };
+}
+
+async function tool_pause_dept({ dept_name, reason, dry_run = true } = {}) {
+  const body = { op: 'pause_dept', dept_name, reason };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-system-control', method: 'POST', body: systemControlDryRunBody('pause_dept', body) });
+  }
+  const preview = await tool_crownkey_api({ action: 'atlas-system-control', method: 'POST', body: systemControlDryRunBody('pause_dept', body) });
+  if (preview?.ok === false) return preview;
+  return queueCommanderAction({
+    tool: 'pause_dept',
+    summary: `Pause dept ${dept_name}. Reason: ${reason}`,
+    action: 'atlas-system-control',
+    body,
+    preview,
+  });
+}
+
+async function tool_resume_dept({ dept_name, dry_run = true } = {}) {
+  const body = { op: 'resume_dept', dept_name };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-system-control', method: 'POST', body: systemControlDryRunBody('resume_dept', body) });
+  }
+  const preview = await tool_crownkey_api({ action: 'atlas-system-control', method: 'POST', body: systemControlDryRunBody('resume_dept', body) });
+  if (preview?.ok === false) return preview;
+  return queueCommanderAction({
+    tool: 'resume_dept',
+    summary: `Resume dept ${dept_name}.`,
+    action: 'atlas-system-control',
+    body,
+    preview,
+  });
+}
+
+async function tool_system_freeze({ reason, dry_run = true } = {}) {
+  const body = { op: 'system_freeze', reason };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-system-control', method: 'POST', body: systemControlDryRunBody('system_freeze', body) });
+  }
+  const preview = await tool_crownkey_api({ action: 'atlas-system-control', method: 'POST', body: systemControlDryRunBody('system_freeze', body) });
+  if (preview?.ok === false) return preview;
+  const p = preview?.preview || {};
+  return queueCommanderAction({
+    tool: 'system_freeze',
+    summary: `🚨 HARD STOP — system_freeze. Will halt ${p.active_campaigns_count ?? '?'} active campaign(s), ${p.queued_contacts ?? '?'} queued contact(s). Daily cap used: ${p.sent_today ?? '?'}/${p.daily_cap ?? '?'}. Reason: ${reason}. HIGH RISK.`,
+    action: 'atlas-system-control',
+    body,
+    preview,
+  });
+}
+
+async function tool_system_unfreeze({ dry_run = true } = {}) {
+  const body = { op: 'system_unfreeze' };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-system-control', method: 'POST', body: systemControlDryRunBody('system_unfreeze', body) });
+  }
+  const preview = await tool_crownkey_api({ action: 'atlas-system-control', method: 'POST', body: systemControlDryRunBody('system_unfreeze', body) });
+  if (preview?.ok === false) return preview;
+  const p = preview?.preview || {};
+  return queueCommanderAction({
+    tool: 'system_unfreeze',
+    summary: `Clear global_freeze. WABA level=${p.waba?.level ?? '?'}, fail_pct=${p.waba?.fail_pct ?? '?'}%. Currently frozen: ${p.currently_frozen ? 'yes' : 'no'}.`,
+    action: 'atlas-system-control',
+    body,
+    preview,
+  });
+}
+
+async function tool_emergency_stop_all_campaigns({ reason, dry_run = true } = {}) {
+  const body = { op: 'emergency_stop_all_campaigns', reason };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-system-control', method: 'POST', body: systemControlDryRunBody('emergency_stop_all_campaigns', body) });
+  }
+  const preview = await tool_crownkey_api({ action: 'atlas-system-control', method: 'POST', body: systemControlDryRunBody('emergency_stop_all_campaigns', body) });
+  if (preview?.ok === false) return preview;
+  const cnt = preview?.preview?.active_campaigns_count ?? 0;
+  return queueCommanderAction({
+    tool: 'emergency_stop_all_campaigns',
+    summary: `🚨 NUCLEAR — pause ${cnt} active campaign(s) at once. Reason: ${reason}. HIGHEST RISK.`,
+    action: 'atlas-system-control',
+    body,
+    preview,
+  });
+}
+
 async function tool_delegate_to_dept({ dept, task, priority = 'normal', payload = {} }) {
   try {
     const r = await fetchT(`${CK_BASE}?action=delegate`, {
@@ -936,6 +1028,11 @@ const TOOL_HANDLERS = {
   contact_blacklist: tool_contact_blacklist,
   contact_whitelist: tool_contact_whitelist,
   bulk_blacklist_from_filter: tool_bulk_blacklist_from_filter,
+  pause_dept: tool_pause_dept,
+  resume_dept: tool_resume_dept,
+  system_freeze: tool_system_freeze,
+  system_unfreeze: tool_system_unfreeze,
+  emergency_stop_all_campaigns: tool_emergency_stop_all_campaigns,
   delegate_to_dept: tool_delegate_to_dept,
 };
 
