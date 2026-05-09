@@ -213,6 +213,9 @@ const TOOLS = [
   { name: 'resume_campaign', description: 'Campaign Control write tool. Resume a paused campaign by campaign_id after backend WABA/sender health checks. Returns a confirmation token unless dry_run=true. Logs to dept_inbox after execution.', input_schema: { type: 'object', properties: { campaign_id: { type: 'integer' }, dry_run: { type: 'boolean' } }, required: ['campaign_id'] } },
   { name: 'rotate_template', description: 'Campaign Control write tool. Influences the next Director pick by setting old_template skipped and new_template approved. This does not rewrite a stored schedule row; Director/Meta/Data gates still apply. Returns a confirmation token unless dry_run=true.', input_schema: { type: 'object', properties: { old_template: { type: 'string' }, new_template: { type: 'string' }, reason: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['old_template', 'new_template'] } },
   { name: 'trigger_template_preview', description: 'Campaign Control write tool. Runs template_preview.php on demand for tomorrow/current planned pick. Returns a confirmation token unless dry_run=true.', input_schema: { type: 'object', properties: { dry_run: { type: 'boolean' } } } },
+  { name: 'recovery_pause', description: 'Recovery Control write tool. Pauses Recovery by setting the recovery kill switch with a required reason. dry_run=true previews current pause state only. dry_run=false returns a confirmation token; it does not execute until confirm_commander_action is called. Logs to dept_inbox after execution.', input_schema: { type: 'object', properties: { reason: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['reason'] } },
+  { name: 'recovery_resume', description: 'Recovery Control write tool. Resumes Recovery by clearing the recovery kill switch after backend WABA health verification. dry_run=true previews current pause state and WABA status. dry_run=false returns a confirmation token; it does not execute until confirm_commander_action is called. Logs to dept_inbox after execution.', input_schema: { type: 'object', properties: { dry_run: { type: 'boolean' } } } },
+  { name: 'recovery_drain', description: 'Recovery Control write tool. Manually triggers Recovery to drain failed contacts. Must verify WABA OK and respect daily_send_ceiling before execution. dry_run=true returns candidate batches and contact_ids that would be drained. dry_run=false returns a confirmation token; limits over 100 are high-risk and must be explicitly confirmed before execution. Logs to dept_inbox after execution.', input_schema: { type: 'object', properties: { limit: { type: 'integer', description: 'Optional max contacts to drain. Backend caps this at daily_send_ceiling.' }, dry_run: { type: 'boolean' } } } },
   { name: 'delegate_to_dept', description: 'Delegate a task to a specific department. The dept reads its task queue on its next tick and executes. Use this instead of doing the work yourself when an existing dept owns the responsibility. Framework v1 depts (meta_health, campaign_director, data_control, watchdog, campaign_dept, data_specialist) are reachable too — but in practice they run as inline phases of the outreach pipeline; for one-off framework calls prefer crownkey_api with action=outreach-pipeline / ceo-campaign / framework-status.', input_schema: { type: 'object', properties: { dept: { type: 'string', enum: ['finance','sales','diagnostic','watchdog','hr','campaign','crm_bridge','reply_enricher','meta_health','campaign_director','data_control','campaign_dept','data_specialist'] }, task: { type: 'string', description: 'Imperative description, like \"investigate sender X failure rate\"' }, priority: { type: 'string', enum: ['low','normal','high'] }, payload: { type: 'object', description: 'Optional structured args' } }, required: ['dept', 'task'] } },
 ];
 
@@ -483,13 +486,13 @@ function makeCommanderToken() {
   return `CK${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
 }
 
-function queueCommanderAction({ tool, summary, body }) {
+function queueCommanderAction({ tool, summary, body, action = 'atlas-campaign-control' }) {
   cleanupCommanderActions();
   const token = makeCommanderToken();
   pendingCommanderActions.set(token, {
     tool,
     summary,
-    action: 'atlas-campaign-control',
+    action,
     body,
     created_at: Date.now(),
     expires_at: Date.now() + COMMANDER_TOKEN_TTL_MS,
@@ -584,6 +587,50 @@ async function tool_trigger_template_preview({ dry_run = true } = {}) {
   });
 }
 
+function recoveryControlDryRunBody(op, input = {}) {
+  return { ...input, op, dry_run: true };
+}
+
+async function tool_recovery_pause({ reason, dry_run = true } = {}) {
+  const body = { op: 'recovery_pause', reason };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-recovery-control', method: 'POST', body: recoveryControlDryRunBody('recovery_pause', body) });
+  }
+  return queueCommanderAction({
+    tool: 'recovery_pause',
+    summary: `Pause Recovery. Reason: ${reason}`,
+    action: 'atlas-recovery-control',
+    body,
+  });
+}
+
+async function tool_recovery_resume({ dry_run = true } = {}) {
+  const body = { op: 'recovery_resume' };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-recovery-control', method: 'POST', body: recoveryControlDryRunBody('recovery_resume', body) });
+  }
+  return queueCommanderAction({
+    tool: 'recovery_resume',
+    summary: 'Resume Recovery after backend WABA health check.',
+    action: 'atlas-recovery-control',
+    body,
+  });
+}
+
+async function tool_recovery_drain({ limit, dry_run = true } = {}) {
+  const body = { op: 'recovery_drain', limit };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-recovery-control', method: 'POST', body: recoveryControlDryRunBody('recovery_drain', body) });
+  }
+  const lim = Number(limit || 0);
+  return queueCommanderAction({
+    tool: 'recovery_drain',
+    summary: `Manually drain Recovery failed contacts${lim > 0 ? ` with limit ${lim}` : ' using the daily ceiling'}${lim > 100 ? ' (HIGH RISK: over 100 contacts)' : ''}.`,
+    action: 'atlas-recovery-control',
+    body,
+  });
+}
+
 async function tool_delegate_to_dept({ dept, task, priority = 'normal', payload = {} }) {
   try {
     const r = await fetchT(`${CK_BASE}?action=delegate`, {
@@ -624,6 +671,9 @@ const TOOL_HANDLERS = {
   resume_campaign: tool_resume_campaign,
   rotate_template: tool_rotate_template,
   trigger_template_preview: tool_trigger_template_preview,
+  recovery_pause: tool_recovery_pause,
+  recovery_resume: tool_recovery_resume,
+  recovery_drain: tool_recovery_drain,
   delegate_to_dept: tool_delegate_to_dept,
 };
 
