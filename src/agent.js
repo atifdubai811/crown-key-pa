@@ -100,12 +100,77 @@ KEY ENDPOINTS — call via crownkey_api tool:
                                    volume_override?, audience_filter?:{area, role}}. Returns
                                    {need_input: 'image'|'template_match'|'template_not_found', detail}
                                    when more info required.
-  ?action=framework-status       live state of all 7 depts in one JSON, ~1.3s response — use this
-                                   instead of polling each dept individually
+  ?action=framework-status       live state of all 8 depts in one JSON, ~1.3s response — use this
+                                   instead of polling each dept individually. Includes departments.recovery
+                                   block: paused, paused_until, state_rows, permanent_marked, soft_exhausted,
+                                   pair_exhausted, open_template_alerts, last_run summary.
+  ?action=recovery-tick          manual Recovery run. Optional ?dry_run=1 plans without committing.
+                                   Optional ?cap=N and ?senders=A,B,C override Meta Health defaults.
+  ?action=recovery-pause         POST. Optional body {hours: N, reason: "..."}. Without hours = indefinite.
+                                   Sets system_signals.recovery_paused=1; Recovery skips on next run.
+  ?action=recovery-resume        POST. Clears the pause signal. Recovery resumes next pipeline run.
+  ?action=template-clear-alert   POST body {template: "name", cleared_by: "atif"}. Clears the active
+                                   alert row in dept_template_alerts so Recovery can use the template again.
+                                   Director never stops using it — only Recovery defers.
   ?action=template-preview-tick  fires nightly Director-dry-run preview to Atif's Telegram + WhatsApp
   ?action=oauth-watchdog-tick    manual scan for expired Google tokens
   Legacy ?action=outreach-sweep / ?action=campaign-day forward to outreach-pipeline (kept for cron compat).
   ?action=auto-retry-sweep returns HTTP 410 Gone — RETIRED 2026-05-06.
+
+=== RECOVERY DEPARTMENT (added 2026-05-07) ===
+
+Recovery is the 8th framework dept. It drains the failed-number backlog by retrying specific
+(contact, template) pairs that previously failed, with sender rotation and 72h/48h cooldowns.
+It runs as stage 2 of the daily pipeline (after Meta Health, before Director). Recovery has
+PRIORITY — it consumes Meta Health's daily cap first; Director gets the remainder.
+
+Recovery NEVER blocks contacts globally for any reason except permanent Meta codes
+(130472, 131050) or the rare 5-attempts-in-30-days safety net. After 3 attempts on the same
+(contact, template) pair, that PAIR is dead for 30 days but the CONTACT stays 100% active in
+the main pool — Director can pick them for any other template immediately.
+
+Recovery NEVER modifies templates. If it sees 132015 (paused), 132016 (disabled), or >40%
+failure rate over 100+ recent attempts, it sends Atif a Telegram alert and FREEZES the
+template for retries until manually cleared. Director keeps using the template normally.
+
+SLASH COMMANDS Atif uses on Telegram:
+  /recovery_pause           → call crownkey_api action=recovery-pause (POST, no body) — indefinite halt
+  /recovery_pause 24h       → call crownkey_api action=recovery-pause (POST, body {hours:24}) — 24h halt
+  /recovery_resume          → call crownkey_api action=recovery-resume (POST) — resume
+  /template_clear NAME      → call crownkey_api action=template-clear-alert (POST, body {template:"NAME", cleared_by:"atif"})
+  /director_approve NAME    → call crownkey_api action=director-approve (POST, body {template:"NAME", decided_by:"atif"}) — Director uses NAME on next pipeline run; signal expires after 24h
+  /director_skip NAME       → call crownkey_api action=director-skip (POST, body {template:"NAME", decided_by:"atif"}) — Director skips NAME for 7 days; signal auto-expires
+  /image_swap NAME URL      → call crownkey_api action=image-swap (POST, body {template:"NAME", image_url:"URL", decided_by:"atif"})
+                                Server HEAD-validates the URL first. If HTTP != 200 or content-type != image/*,
+                                the server returns 422 with error 'image_unreachable_or_invalid' and NO state
+                                mutation occurs — relay that error verbatim to Atif so he tries another URL.
+                                On success: tpl_image_override:NAME is set + director_decision:NAME=approved (24h TTL).
+                                Reply to Atif with the message field from the response (it tells him when Director
+                                will use the image and reminds him to ask in 24h whether the swap worked).
+
+When Atif uses any of these slash commands, IMMEDIATELY call the corresponding endpoint.
+Don't ask for confirmation — the slash command IS the confirmation. After the call, reply
+briefly with what you did (e.g. "Recovery paused, Director takes the full cap until you resume.").
+
+DIRECTOR-SIDE APPROVAL GATE: Director will sometimes send Atif a Telegram like:
+  "🚦 Director wants to use TEMPLATE today. Recent failure rate: X% over N attempts.
+   Reply within 60 min: /director_approve TEMPLATE or /director_skip TEMPLATE"
+
+This means Director's top-ranked template has >35% failure rate over 100+ recent attempts.
+Director has ALREADY skipped this template for the current run and picked the next-best.
+Atif's reply influences future runs (24h TTL on approve, 7-day TTL on skip).
+If you see Director's gate message and Atif asks "what should I do?", you can call
+crownkey_api action=stats with the template name to see actual delivery numbers
+before recommending. Or just summarize what 35%+ failure means: image likely broken,
+content may have been flagged by Meta, or audience mismatch.
+
+When Atif asks "what's Recovery doing today?" or similar: call framework-status, summarize the
+recovery block. Always check open_template_alerts_detail — if non-empty, list the templates
+that need his judgment with the trigger reason and sample contact ids.
+
+If Atif sees 131042 events still firing post-Meta-Business-fix: the sender_issue_digest events
+in dept_inbox will surface them. Recovery does NOT block contacts on 131042 — it's a sender-side
+issue Atif handles via Meta's business dashboard.
 
 UI: https://crownkey.online/framework.html — 7-dept live status board + CEO Command form. Polls every 8s.
 Classic dashboard at https://crownkey.online/dashboard.html still has charts and read-only views.
@@ -158,6 +223,15 @@ DO NOT mix in: CSV files, WF04 / 90-Day Auto-Scheduler data, "BATCH_A_*" naming 
 emaar / oasis / etc. as "the plan" unless they appear in the actual framework-status response. Those are
 either legacy artifacts or templates that the Director might or might not pick — don't fabricate a plan
 by reading a CSV; the Director will pick at 19:00 GST.
+
+CURRENT FRAMEWORK V1 PIPELINE (8 stages, in execution order):
+  1. Meta Health        — grants/denies launch, sets cap, identifies healthy senders
+  2. Recovery (NEW)     — drains failed-number backlog with priority over fresh outreach
+  3. Campaign Director  — picks template + image for the remaining cap
+  4. Data Control       — assembles contact rows
+  5. Watchdog           — dedup hard rules (45-day waiting period, perm-fail codes, opt-out)
+  6. Campaign Department — creates campaigns + queue rows
+  7. Audit + Telegram   — pipeline summary digest
 
 CURRENT ECOSYSTEM SUPPORTING DEPARTMENTS (verify via handbook for latest):
 - Finance Dept (COcQBSKbvUiQ3TcO) — auto-pauses bad campaigns, owns daily_send_ceiling signal
@@ -222,6 +296,10 @@ const TOOLS = [
   { name: 'director_skip', description: 'Director/Gate Control write tool. Skips a template for the current/future Director run. dry_run=true previews the 7-day skip, current decision state, and which next template Director would likely pick instead. dry_run=false returns a confirmation token; execution logs to dept_inbox.', input_schema: { type: 'object', properties: { template_name: { type: 'string' }, reason: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['template_name', 'reason'] } },
   { name: 'director_approve_pending', description: 'Director/Gate Control write tool. Approves every currently pending Director gate decision. dry_run=true lists all pending templates before approval. dry_run=false returns a confirmation token; execution logs each approved template to dept_inbox.', input_schema: { type: 'object', properties: { dry_run: { type: 'boolean' } } } },
   { name: 'director_set_threshold', description: 'Director/Gate Control write tool. Sets Director failure-rate gate threshold as a percent. Backend enforces sane bounds: minimum 10, maximum 60. dry_run=true previews old and new values. dry_run=false returns a confirmation token; execution logs old and new threshold to dept_inbox.', input_schema: { type: 'object', properties: { percent: { type: 'number' }, dry_run: { type: 'boolean' } }, required: ['percent'] } },
+  { name: 'contact_lookup', description: 'Contact/Data Ops read tool. Pure read, no confirmation required. Returns the full contact record, recent outbound history (campaigns + senders), recent inbound replies, current state (active/blacklisted/unknown), any blacklist signal with set_by/reason, and active queue rows. Use this BEFORE proposing contact_blacklist so Atif sees what he is acting on. Phones may be passed with or without leading + or country code; backend normalizes to digits.', input_schema: { type: 'object', properties: { phone: { type: 'string', description: 'WhatsApp phone number, e.g. 971501234567 or +971501234567.' } }, required: ['phone'] } },
+  { name: 'contact_blacklist', description: 'Contact/Data Ops write tool. Blacklists one phone so future outreach is prevented across all campaigns. Writes system_signals.contact_blacklisted:<phone>, sets contacts.wa_blocked_at so the existing Watchdog R4 rule blocks future sends with no other code changes, and cancels active queued rows (status 1 or 4 → 99 cancelled). Backend rejects protected phones (Atif and known sender phone_number_ids). dry_run=true previews. dry_run=false returns a confirmation token; execution logs to dept_inbox. Reversible via contact_whitelist.', input_schema: { type: 'object', properties: { phone: { type: 'string' }, reason: { type: 'string', description: 'Required short reason — surfaces in dept_inbox and the signal set_by field.' }, dry_run: { type: 'boolean' } }, required: ['phone', 'reason'] } },
+  { name: 'contact_whitelist', description: 'Contact/Data Ops write tool. Removes one phone from the blacklist by deleting the contact_blacklisted:<phone> signal and clearing contacts.wa_blocked_at if it was set. Use this to reverse a previous blacklist. dry_run=true previews. dry_run=false returns a confirmation token; execution logs to dept_inbox.', input_schema: { type: 'object', properties: { phone: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['phone'] } },
+  { name: 'bulk_blacklist_from_filter', description: 'Contact/Data Ops write tool. Blacklists multiple phones matching a filter. Filter types: {type:"replied_stop", since_days?} catches contacts whose latest inbound text was STOP/UNSUBSCRIBE/REMOVE ME/NO. {type:"failed_with_code", code, since_days?} catches contacts whose outbound failed with a specific Meta error code (e.g. 131026, 130472). HARD CAP 500 — backend rejects with HTTP 400 if filter matches more, asking user to narrow scope. Protected phones (Atif, sender ids) are stripped automatically. dry_run=true returns matched_count + first 10 sample phones. dry_run=false returns a confirmation token; over-100 matches are flagged HIGH RISK in the summary. Logs total to dept_inbox.', input_schema: { type: 'object', properties: { filter: { type: 'object', description: 'Filter specification.', properties: { type: { type: 'string', enum: ['replied_stop','failed_with_code'] }, code: { type: 'integer' }, since_days: { type: 'integer' } }, required: ['type'] }, reason: { type: 'string', description: 'Required short reason.' }, dry_run: { type: 'boolean' } }, required: ['filter', 'reason'] } },
   { name: 'delegate_to_dept', description: 'Delegate a task to a specific department. The dept reads its task queue on its next tick and executes. Use this instead of doing the work yourself when an existing dept owns the responsibility. Framework v1 depts (meta_health, campaign_director, data_control, watchdog, campaign_dept, data_specialist) are reachable too — but in practice they run as inline phases of the outreach pipeline; for one-off framework calls prefer crownkey_api with action=outreach-pipeline / ceo-campaign / framework-status.', input_schema: { type: 'object', properties: { dept: { type: 'string', enum: ['finance','sales','diagnostic','watchdog','hr','campaign','crm_bridge','reply_enricher','meta_health','campaign_director','data_control','campaign_dept','data_specialist'] }, task: { type: 'string', description: 'Imperative description, like \"investigate sender X failure rate\"' }, priority: { type: 'string', enum: ['low','normal','high'] }, payload: { type: 'object', description: 'Optional structured args' } }, required: ['dept', 'task'] } },
 ];
 
@@ -744,6 +822,67 @@ async function tool_director_set_threshold({ percent, dry_run = true } = {}) {
   });
 }
 
+function contactControlDryRunBody(op, input = {}) {
+  return { ...input, op, dry_run: true };
+}
+
+async function tool_contact_lookup({ phone } = {}) {
+  // Pure read — no token / dry_run required. Backend ignores dry_run for this op.
+  const body = { op: 'contact_lookup', phone };
+  return tool_crownkey_api({ action: 'atlas-contact-control', method: 'POST', body });
+}
+
+async function tool_contact_blacklist({ phone, reason, dry_run = true } = {}) {
+  const body = { op: 'contact_blacklist', phone, reason };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-contact-control', method: 'POST', body: contactControlDryRunBody('contact_blacklist', body) });
+  }
+  const preview = await tool_crownkey_api({ action: 'atlas-contact-control', method: 'POST', body: contactControlDryRunBody('contact_blacklist', body) });
+  if (preview?.ok === false) return preview;
+  const cancelCnt = preview?.preview?.will_remove_queue_rows ?? 0;
+  return queueCommanderAction({
+    tool: 'contact_blacklist',
+    summary: `Blacklist phone ${phone}. Cancels ${cancelCnt} queued row(s). Reason: ${reason}`,
+    action: 'atlas-contact-control',
+    body,
+    preview,
+  });
+}
+
+async function tool_contact_whitelist({ phone, dry_run = true } = {}) {
+  const body = { op: 'contact_whitelist', phone };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-contact-control', method: 'POST', body: contactControlDryRunBody('contact_whitelist', body) });
+  }
+  const preview = await tool_crownkey_api({ action: 'atlas-contact-control', method: 'POST', body: contactControlDryRunBody('contact_whitelist', body) });
+  if (preview?.ok === false) return preview;
+  return queueCommanderAction({
+    tool: 'contact_whitelist',
+    summary: `Whitelist phone ${phone} (clear blacklist signal + wa_blocked_at).`,
+    action: 'atlas-contact-control',
+    body,
+    preview,
+  });
+}
+
+async function tool_bulk_blacklist_from_filter({ filter, reason, dry_run = true } = {}) {
+  const body = { op: 'bulk_blacklist_from_filter', filter, reason };
+  if (dry_run !== false) {
+    return tool_crownkey_api({ action: 'atlas-contact-control', method: 'POST', body: contactControlDryRunBody('bulk_blacklist_from_filter', body) });
+  }
+  const preview = await tool_crownkey_api({ action: 'atlas-contact-control', method: 'POST', body: contactControlDryRunBody('bulk_blacklist_from_filter', body) });
+  if (preview?.ok === false) return preview;
+  const cnt = preview?.matched_count ?? 0;
+  const protSkip = preview?.protected_skipped_count ?? 0;
+  return queueCommanderAction({
+    tool: 'bulk_blacklist_from_filter',
+    summary: `Bulk blacklist ${cnt} phone(s) matching filter ${JSON.stringify(filter)} (${protSkip} protected stripped). Reason: ${reason}${cnt > 100 ? ' (HIGH RISK: over 100 contacts)' : ''}`,
+    action: 'atlas-contact-control',
+    body,
+    preview,
+  });
+}
+
 async function tool_delegate_to_dept({ dept, task, priority = 'normal', payload = {} }) {
   try {
     const r = await fetchT(`${CK_BASE}?action=delegate`, {
@@ -793,6 +932,10 @@ const TOOL_HANDLERS = {
   director_skip: tool_director_skip,
   director_approve_pending: tool_director_approve_pending,
   director_set_threshold: tool_director_set_threshold,
+  contact_lookup: tool_contact_lookup,
+  contact_blacklist: tool_contact_blacklist,
+  contact_whitelist: tool_contact_whitelist,
+  bulk_blacklist_from_filter: tool_bulk_blacklist_from_filter,
   delegate_to_dept: tool_delegate_to_dept,
 };
 
