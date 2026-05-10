@@ -269,6 +269,49 @@ OAUTH WATCHDOG (R4oujlDFEoUOoMk8, every 5 min, NEW 2026-05-06) — scans n8n exe
 errors → Telegram alert within <5 min. The 2026-05-06 silent-failure incident (where Google Sheets
 OAuth expired and we lost 6 hours of CRM updates) won't repeat.
 
+=== MEMORY (Phase B, 2026-05-10) ===
+
+You have persistent conversation memory across Railway restarts and across days,
+stored in Google Sheet "Conversation Log" via Memory Manager (wzRiftvNy27jRnZQ).
+THREE mechanisms — most of the time you do nothing; the system handles it:
+
+1. AUTOMATIC SAVE — every Telegram turn is saved server-side after your reply
+   ships. You don't call anything. Skipped for trivial acks (<3 chars), failed
+   turns, slash commands, and during /private_session windows. Routine —
+   no thought required.
+
+2. EXPLICIT IMPRINT (save_memory tool) — call this only when Atif explicitly
+   says "remember that…", "for next time…", "tag this as X", or when you
+   discover a fact worth tagging that auto-save would miss (a preference, a
+   hard rule, a one-off number that will matter later, a deal milestone).
+   Pass tags + key_facts. Tags are open-vocabulary — pick whatever describes
+   the imprint (e.g., ["preference"], ["deal:thevally11","fail-rate"]). Do NOT
+   call save_memory on every turn — that creates duplicate rows. One imprint
+   per memorable moment, max.
+
+3. RECALL (recall_memory tool) — call this when Atif's message contains:
+     - Recall triggers: "remember", "last time", "earlier", "we discussed",
+       "yesterday", "before", "you said", "previously", "this morning"
+     - Specific past entities: a template name (thevally11, ilprimo, etc.),
+       a campaign id, a deal name, a number that wasn't in this conversation
+   Do NOT call recall_memory for fresh-state questions like "today campaign
+   status" or "current WABA quality" — use the named status tools for those.
+   recall_memory results are scored by keyword overlap. If score is 0 or
+   timestamps are weeks old, the match is weak — don't fabricate continuity
+   from a low-confidence hit. If you genuinely don't find something, say so
+   honestly: "I don't have a record of that."
+
+   Default scope: same conversation only (your current chat_id, telegram
+   channel). To search another conversation pass chat_id explicitly. To
+   search across channels pass channel="all".
+
+4. The /forget_last and /forget slash commands are handled by the server
+   BEFORE your loop runs — you'll never see them as user messages. No tool
+   call needed.
+
+Memory limits: simple keyword search, no embeddings yet. At ~10k rows we'll
+migrate to vector search; that's not your problem today.
+
 IMMUTABLE RULES (CEO directive 2026-05-06):
   1. Pass all qualified replies to CRM. Auto-replies/STOPs filtered, everything else lands in iSolveRealtor.
   2. 45-day waiting period between sends to the same phone — Watchdog enforces, no per-contact override.
@@ -380,6 +423,8 @@ const TOOLS = [
   { name: 'system_unfreeze', description: 'System Control write tool. Clears the global_freeze signal so outreach resumes. Re-checks WABA hourly fail rate before clearing — if fail rate > 50% (critical) the unfreeze is REJECTED with HTTP 400 to avoid releasing the brake while sends are bleeding. dry_run=true previews current freeze state and computed WABA level. dry_run=false returns a confirmation token. Logs to dept_inbox.', input_schema: { type: 'object', properties: { dry_run: { type: 'boolean' } } } },
   { name: 'emergency_stop_all_campaigns', description: 'System Control write tool. NUCLEAR — pauses every active campaign in one operation (campaigns.status IN (1,2,5) → 4, plus their queued whatsapp_message_queue rows IN (1,2,5) → 4). HARD CAP 20: if more than 20 active campaigns exist the backend rejects with HTTP 400 (an unusually high count signals runaway state requiring per-campaign investigation, not a sweep). dry_run=true lists EVERY active campaign by id/title/template/queue size so Atif sees the full impact. dry_run=false returns a confirmation token; HIGHEST RISK in the summary. Logs ONE dept_inbox event with full campaign list. Reversible per-campaign via resume_campaign.', input_schema: { type: 'object', properties: { reason: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['reason'] } },
   { name: 'delegate_to_dept', description: 'Delegate a task to a specific department. The dept reads its task queue on its next tick and executes. Use this instead of doing the work yourself when an existing dept owns the responsibility. Framework v1 depts (meta_health, campaign_director, data_control, watchdog, campaign_dept, data_specialist) are reachable too — but in practice they run as inline phases of the outreach pipeline; for one-off framework calls prefer crownkey_api with action=outreach-pipeline / ceo-campaign / framework-status.', input_schema: { type: 'object', properties: { dept: { type: 'string', enum: ['finance','sales','diagnostic','watchdog','hr','campaign','crm_bridge','reply_enricher','meta_health','campaign_director','data_control','campaign_dept','data_specialist'] }, task: { type: 'string', description: 'Imperative description, like \"investigate sender X failure rate\"' }, priority: { type: 'string', enum: ['low','normal','high'] }, payload: { type: 'object', description: 'Optional structured args' } }, required: ['dept', 'task'] } },
+  { name: 'recall_memory', description: 'Search past Telegram conversations with Atif. Use when he references "last time", "earlier", "we discussed", "remember", "yesterday", or any specific past entity (a campaign, a template name, a deal name, a number that wasn\'t in the current message). Do NOT call for fresh-state questions ("today campaign status", "current WABA quality") — use the named status tools for those. Returns up to N most-relevant rows scored by keyword overlap. If nothing scores >0, returns the most recent rows instead, so always check `score` and `timestamp` before treating a match as authoritative. Defaults to current chat_id; pass another to read cross-conversation. Defaults to telegram channel; pass channel="all" to disable channel filter.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Free-text search. Concatenate user phrasing + topic keywords. Required.' }, chat_id: { type: 'string', description: 'Optional. Defaults to the current conversation_id.' }, channel: { type: 'string', description: 'Optional. Defaults to "telegram"; pass "all" to search across channels.' }, limit: { type: 'integer', description: 'Optional, default 5, capped at 20.' } }, required: ['query'] } },
+  { name: 'save_memory', description: 'Persist a structured memory imprint with explicit tags and key_facts. Use ONLY when Atif says "remember that...", "for next time...", or when you discover a fact worth tagging that the auto-save would not capture (a preference, a hard rule, a deal-specific number). Routine turns are saved automatically — do NOT call save_memory on every turn or you create duplicate rows. One imprint per memorable moment, max.', input_schema: { type: 'object', properties: { user_msg: { type: 'string', description: 'The user message or paraphrased context. Required.' }, assistant_msg: { type: 'string', description: 'Your reply or summary. Required.' }, tags: { type: 'array', items: { type: 'string' }, description: 'Optional explicit tags. Open vocabulary — pick whatever describes the imprint (e.g., ["preference","rule","deal:thevally11"]).' }, key_facts: { type: 'array', items: { type: 'string' }, description: 'Optional one-line facts the recall search should be able to surface verbatim.' } }, required: ['user_msg', 'assistant_msg'] } },
 ];
 
 async function tool_bash({ command, timeout_s = 30 }) {
@@ -1060,6 +1105,66 @@ async function tool_delegate_to_dept({ dept, task, priority = 'normal', payload 
   } catch (e) { return { error: String(e) }; }
 }
 
+// --- Memory tools (Phase B, 2026-05-10) ---
+// Both wrap Memory Manager (n8n workflow wzRiftvNy27jRnZQ) webhooks. Auto-save
+// for routine turns happens server-side in server.js — these handlers exist so
+// Atlas can do explicit imprints (save_memory) and active recall (recall_memory).
+// `ctx.conversation_id` is injected by the runTool dispatcher so we default
+// chat_id to the current conversation without Atlas having to thread it.
+
+async function tool_recall_memory({ query, chat_id, channel, limit }, ctx = {}) {
+  const body = {
+    query: String(query || ''),
+    chat_id: chat_id || ctx.conversation_id || '',
+    channel: channel || 'telegram',
+    limit: Math.min(20, parseInt(limit, 10) || 5),
+  };
+  try {
+    const r = await fetchT(`${N8N_URL}/webhook/recall-history`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }, 8000);
+    if (!r.ok) {
+      return { ok: true, matches: [], total_log_rows: 0, note: `memory_unreachable_http_${r.status}` };
+    }
+    const data = await r.json().catch(() => null);
+    if (!data || !Array.isArray(data.matches)) {
+      return { ok: true, matches: [], total_log_rows: 0, note: 'memory empty or unreachable' };
+    }
+    return { ok: true, ...data };
+  } catch (e) {
+    return { ok: true, matches: [], total_log_rows: 0, note: 'memory_unreachable: ' + String(e.message || e) };
+  }
+}
+
+async function tool_save_memory({ user_msg, assistant_msg, tags, key_facts }, ctx = {}) {
+  if (!user_msg || !assistant_msg) return { ok: false, error: 'user_msg and assistant_msg required' };
+  const body = {
+    chat_id: ctx.conversation_id || '',
+    user_msg: String(user_msg),
+    assistant_msg: String(assistant_msg),
+    tags: Array.isArray(tags) ? tags : [],
+    key_facts: Array.isArray(key_facts) ? key_facts : [],
+    iterations: 1,
+    had_image: false,
+    had_action: true,
+    source: 'explicit_imprint',
+    channel: 'telegram',
+  };
+  try {
+    const r = await fetchT(`${N8N_URL}/webhook/save-conversation`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }, 8000);
+    if (!r.ok) return { ok: false, error: 'memory_unreachable' };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: 'memory_unreachable: ' + String(e.message || e) };
+  }
+}
+
 const TOOL_HANDLERS = {
   bash: tool_bash,
   read_file: tool_read_file,
@@ -1108,6 +1213,8 @@ const TOOL_HANDLERS = {
   system_unfreeze: tool_system_unfreeze,
   emergency_stop_all_campaigns: tool_emergency_stop_all_campaigns,
   delegate_to_dept: tool_delegate_to_dept,
+  recall_memory: tool_recall_memory,
+  save_memory: tool_save_memory,
 };
 
 // Conversation history store with TTL + LRU cap so arbitrary conversation_id values
@@ -1212,7 +1319,9 @@ async function runAgentInner({ message, conversation_id = 'default', max_iterati
         const handler = TOOL_HANDLERS[tu.name];
         let result;
         try {
-          result = handler ? await handler(tu.input) : { error: `unknown tool: ${tu.name}` };
+          // Pass conversation_id so memory tools can default chat_id to the
+          // active conversation without Atlas having to thread it explicitly.
+          result = handler ? await handler(tu.input, { conversation_id }) : { error: `unknown tool: ${tu.name}` };
         } catch (e) {
           result = { error: String(e.message || e) };
         }
