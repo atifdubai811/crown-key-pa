@@ -424,6 +424,7 @@ const TOOLS = [
   { name: 'emergency_stop_all_campaigns', description: 'System Control write tool. NUCLEAR — pauses every active campaign in one operation (campaigns.status IN (1,2,5) → 4, plus their queued whatsapp_message_queue rows IN (1,2,5) → 4). HARD CAP 20: if more than 20 active campaigns exist the backend rejects with HTTP 400 (an unusually high count signals runaway state requiring per-campaign investigation, not a sweep). dry_run=true lists EVERY active campaign by id/title/template/queue size so Atif sees the full impact. dry_run=false returns a confirmation token; HIGHEST RISK in the summary. Logs ONE dept_inbox event with full campaign list. Reversible per-campaign via resume_campaign.', input_schema: { type: 'object', properties: { reason: { type: 'string' }, dry_run: { type: 'boolean' } }, required: ['reason'] } },
   { name: 'delegate_to_dept', description: 'Delegate a task to a specific department. The dept reads its task queue on its next tick and executes. Use this instead of doing the work yourself when an existing dept owns the responsibility. Framework v1 depts (meta_health, campaign_director, data_control, watchdog, campaign_dept, data_specialist) are reachable too — but in practice they run as inline phases of the outreach pipeline; for one-off framework calls prefer crownkey_api with action=outreach-pipeline / ceo-campaign / framework-status.', input_schema: { type: 'object', properties: { dept: { type: 'string', enum: ['finance','sales','diagnostic','watchdog','hr','campaign','crm_bridge','reply_enricher','meta_health','campaign_director','data_control','campaign_dept','data_specialist'] }, task: { type: 'string', description: 'Imperative description, like \"investigate sender X failure rate\"' }, priority: { type: 'string', enum: ['low','normal','high'] }, payload: { type: 'object', description: 'Optional structured args' } }, required: ['dept', 'task'] } },
   { name: 'recall_memory', description: 'Search past Telegram conversations with Atif. Use when he references "last time", "earlier", "we discussed", "remember", "yesterday", or any specific past entity (a campaign, a template name, a deal name, a number that wasn\'t in the current message). Do NOT call for fresh-state questions ("today campaign status", "current WABA quality") — use the named status tools for those. Returns up to N most-relevant rows scored by keyword overlap. If nothing scores >0, returns the most recent rows instead, so always check `score` and `timestamp` before treating a match as authoritative. Defaults to current chat_id; pass another to read cross-conversation. Defaults to telegram channel; pass channel="all" to disable channel filter.', input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Free-text search. Concatenate user phrasing + topic keywords. Required.' }, chat_id: { type: 'string', description: 'Optional. Defaults to the current conversation_id.' }, channel: { type: 'string', description: 'Optional. Defaults to "telegram"; pass "all" to search across channels.' }, limit: { type: 'integer', description: 'Optional, default 5, capped at 20.' } }, required: ['query'] } },
+  { name: 'crm_lockdown_check', description: 'Verifies CRM lockdown compliance. Returns the daily summary of CRM writes — should always be INSERT-only into dbo.IntegratedLead. Reports: 24h CRM Bridge run count, 24h sql_violation count (always 0 if guardrail healthy), guardrail markers present, the 14 deleted high-risk workflows confirmed gone. Use when Atif asks about CRM compliance, lockdown status, whether anything has tried to violate the rule, or as part of the daily morning brief CRM Compliance section.', input_schema: { type: 'object', properties: {} } },
   { name: 'save_memory', description: 'Persist a structured memory imprint with explicit tags and key_facts. Use ONLY when Atif says "remember that...", "for next time...", or when you discover a fact worth tagging that the auto-save would not capture (a preference, a hard rule, a deal-specific number). Routine turns are saved automatically — do NOT call save_memory on every turn or you create duplicate rows. One imprint per memorable moment, max.', input_schema: { type: 'object', properties: { user_msg: { type: 'string', description: 'The user message or paraphrased context. Required.' }, assistant_msg: { type: 'string', description: 'Your reply or summary. Required.' }, tags: { type: 'array', items: { type: 'string' }, description: 'Optional explicit tags. Open vocabulary — pick whatever describes the imprint (e.g., ["preference","rule","deal:thevally11"]).' }, key_facts: { type: 'array', items: { type: 'string' }, description: 'Optional one-line facts the recall search should be able to surface verbatim.' } }, required: ['user_msg', 'assistant_msg'] } },
 ];
 
@@ -1112,6 +1113,17 @@ async function tool_delegate_to_dept({ dept, task, priority = 'normal', payload 
 // `ctx.conversation_id` is injected by the runTool dispatcher so we default
 // chat_id to the current conversation without Atlas having to thread it.
 
+async function tool_crm_lockdown_check() {
+  // Read-only call to the lockdown verifier endpoint. No params.
+  try {
+    const r = await fetchT(`${CK_BASE}?action=crm-lockdown-check`, { headers: ckHeaders() });
+    if (!r.ok) return { ok: false, error: `crm_lockdown_check_http_${r.status}` };
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: 'crm_lockdown_check_unreachable: ' + String(e.message || e) };
+  }
+}
+
 async function tool_recall_memory({ query, chat_id, channel, limit }, ctx = {}) {
   const body = {
     query: String(query || ''),
@@ -1215,6 +1227,7 @@ const TOOL_HANDLERS = {
   delegate_to_dept: tool_delegate_to_dept,
   recall_memory: tool_recall_memory,
   save_memory: tool_save_memory,
+  crm_lockdown_check: tool_crm_lockdown_check,
 };
 
 // Conversation history store with TTL + LRU cap so arbitrary conversation_id values
