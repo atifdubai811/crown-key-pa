@@ -264,6 +264,145 @@ app.post('/agent', requireAuth, async (req, res) => {
   }
 });
 
+// Marketing Dept — Telegram media intake (D5, 2026-05-12)
+// Called by the Telegram-PA n8n workflow when Atif uploads a photo or document
+// to the chat. The n8n workflow forwards the message body verbatim; we resolve
+// the file via Telegram getFile, download it, upload to Hostinger via the
+// /n8n-stats.php upload-creative-image endpoint, then call
+// marketing-register-creative with the resulting URL.
+//
+// Body: { telegram_message: <Telegram Update.message>, conversation_id? }
+// The caption format expected: "for <template>" or "for <template> <segment>".
+// If caption is missing/malformed, the endpoint returns ok:true + needs_clarification
+// so Atlas can ask Atif which template the image belongs to.
+async function tg_getFilePath(file_id) {
+  const url = `https://api.telegram.org/bot${TG_TOKEN}/getFile?file_id=${encodeURIComponent(file_id)}`;
+  const r = await fetchT(url, {}, 10000);
+  if (!r.ok) return { ok: false, error: `getFile_http_${r.status}` };
+  const j = await r.json().catch(() => null);
+  if (!j?.ok || !j.result?.file_path) return { ok: false, error: 'getFile_no_path' };
+  return { ok: true, file_path: j.result.file_path, file_id };
+}
+
+async function tg_downloadFile(file_path) {
+  const url = `https://api.telegram.org/file/bot${TG_TOKEN}/${file_path}`;
+  const r = await fetchT(url, {}, 30000);
+  if (!r.ok) return { ok: false, error: `download_http_${r.status}` };
+  const ab = await r.arrayBuffer();
+  return { ok: true, bytes: Buffer.from(ab), filename: file_path.split('/').pop() || 'upload.bin' };
+}
+
+function parseCreativeCaption(caption) {
+  // Accepts: "for <template>", "for <template> <segment>", "<template>", "creative for <template>"
+  const c = (caption || '').toString().trim();
+  if (!c) return { template_name: null, segment: 'ANY' };
+  const m = c.match(/^(?:creative\s+)?for\s+([a-z0-9_\-]+)(?:\s+([a-z0-9_\-]+))?/i)
+         || c.match(/^([a-z0-9_\-]{3,40})(?:\s+([a-z0-9_\-]+))?/i);
+  if (!m) return { template_name: null, segment: 'ANY' };
+  return { template_name: m[1], segment: (m[2] || 'ANY').toUpperCase() };
+}
+
+app.post('/marketing/intake-photo', requireAuth, async (req, res) => {
+  const msg = req.body?.telegram_message || req.body?.message || req.body || {};
+  // Telegram photo: array of size variants; pick the largest. Documents: msg.document.
+  const photos = Array.isArray(msg.photo) ? msg.photo : null;
+  const doc = msg.document || null;
+  const caption = msg.caption || msg.text || '';
+  let file_id = null, declared_mime = null, declared_filename = null;
+  if (photos && photos.length) {
+    file_id = photos[photos.length - 1].file_id;
+    declared_mime = 'image/jpeg';
+  } else if (doc?.file_id) {
+    file_id = doc.file_id;
+    declared_mime = doc.mime_type || null;
+    declared_filename = doc.file_name || null;
+  }
+  if (!file_id) return res.status(400).json({ ok: false, error: 'no_file_id', detail: 'expected message.photo[] or message.document' });
+
+  const parsed = parseCreativeCaption(caption);
+  if (!parsed.template_name) {
+    return res.json({
+      ok: true,
+      needs_clarification: true,
+      reason: 'caption_missing_template',
+      file_id,
+      hint: 'Reply with "for <template_name>" so we know which template this image belongs to.',
+    });
+  }
+
+  // Resolve + download from Telegram
+  const path = await tg_getFilePath(file_id);
+  if (!path.ok) return res.status(502).json({ ok: false, step: 'getFile', error: path.error });
+  const dl = await tg_downloadFile(path.file_path);
+  if (!dl.ok) return res.status(502).json({ ok: false, step: 'download', error: dl.error });
+
+  // Upload to Hostinger. n8n-stats.php?action=upload-creative-image accepts
+  // multipart form-data with field 'image' + template_name. (Endpoint added in D5b.)
+  const form = new FormData();
+  const blob = new Blob([dl.bytes], { type: declared_mime || 'image/jpeg' });
+  form.append('image', blob, declared_filename || dl.filename);
+  form.append('template_name', parsed.template_name);
+  form.append('segment', parsed.segment);
+  let uploadResp;
+  try {
+    const r = await fetchT(`${CK_STATS_URL}?action=upload-creative-image`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${CK_TOKEN}` },
+      body: form,
+    }, 30000);
+    uploadResp = { http: r.status, body: await safeJson(r) };
+  } catch (e) {
+    return res.status(502).json({ ok: false, step: 'upload', error: String(e.message || e) });
+  }
+  if (uploadResp.http !== 200 || !uploadResp.body?.ok || !uploadResp.body?.image_url) {
+    return res.status(502).json({ ok: false, step: 'upload', detail: uploadResp });
+  }
+  const image_url = uploadResp.body.image_url;
+  const image_filename = uploadResp.body.image_filename || null;
+
+  // Register the creative — retires any active row for this (template,segment)
+  // and writes tpl_image_override:<template> so Director picks it up immediately.
+  const regBody = {
+    template_name: parsed.template_name,
+    segment: parsed.segment,
+    image_url,
+    image_filename,
+    created_by: 'atif',
+    notes: caption ? `via Telegram intake: ${caption.slice(0, 200)}` : 'via Telegram intake',
+  };
+  if (uploadResp.body.fulfills_pending_id) regBody.fulfills_pending_id = uploadResp.body.fulfills_pending_id;
+
+  let regResp;
+  try {
+    const r = await fetchT(`${CK_STATS_URL}?action=marketing-register-creative`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', Authorization: `Bearer ${CK_TOKEN}` },
+      body: JSON.stringify(regBody),
+    });
+    regResp = { http: r.status, body: await safeJson(r) };
+  } catch (e) {
+    return res.status(502).json({ ok: false, step: 'register', error: String(e.message || e) });
+  }
+
+  // Best-effort: tell Atif on Telegram that the image was registered.
+  if (TG_TOKEN && regResp.body?.ok) {
+    fetchT(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chat_id: TG_CHAT, text: `✅ Image registered for ${parsed.template_name} (${parsed.segment}). Next Director pick uses it.` }),
+    }, 8000).catch(() => {});
+  }
+
+  return res.json({
+    ok: regResp.body?.ok === true,
+    template_name: parsed.template_name,
+    segment: parsed.segment,
+    image_url,
+    creative_id: regResp.body?.creative_id || null,
+    upload: uploadResp.body,
+    register: regResp.body,
+  });
+});
+
 // Watchdog
 let lastWatchdogAt = null;
 let watchdogState = { last_failures: 0, last_retried: 0, last_alerted: 0 };
