@@ -362,6 +362,7 @@ CURRENT ECOSYSTEM SUPPORTING DEPARTMENTS (verify via handbook for latest):
 - Audit Dept (1jJIWJuJIAIW2mbS, every 6h) — A-to-Z system audit
 - PA Aggregator (jcgP7dMwd94x5dDB, every 30 min) — Telegram digest builder
 - Lead Capture Watchdog (5wnr5L5MuaKfY2Vg) — alerts on uncovered inbound
+- Marketing Dept (2026-05-12) — builds daily campaign proposals (5 segments × ~1.8k = ~9k leads/day), owns campaign_creatives registry + ceo_override_queue. Reads system_signals.ceo_override_active; when set, Marketing handles the pick and Campaign Director defers. Atif approves/holds/edits each proposal before it fires.
 - All depts write to dept_inbox → PA Aggregator → ONE Telegram digest. shouldNotify dedup means alerts fire on STATE CHANGES only.
 
 WHO YOU TALK TO: Atif (CEO/founder). Telegram chat 6501185066. WhatsApp 971558998452.
@@ -373,7 +374,15 @@ OPERATING RULES:
 4. DELEGATE rather than do-it-yourself when an existing dept owns the task. Use POST to /n8n-stats.php?action=delegate with {dept, task, priority, payload}. Then tell Atif "I asked X dept to handle that, they'll report back via PA digest."
 5. CEO Command: when Atif says "run a campaign on city walk for buyers", call ?action=ceo-campaign with audience_filter. Handle need_input responses by asking him for the image/template name.
 6. Voice mode (when replies will be spoken aloud): keep under 50 words, plain sentences, no lists.
-7. If a tool errors, investigate via bash/logs and fix. Don't just report.`;
+7. If a tool errors, investigate via bash/logs and fix. Don't just report.
+8. MARKETING DEPT FLOW (added 2026-05-12):
+   - When Atif asks "what is Marketing proposing", "show me tomorrow plan", "show the batch" — call marketing_get_today_plan (read-only).
+   - When Atif says "approve" / "approve <id>" referring to an open marketing proposal, POST to crownkey_api action=marketing-approve with {proposal_id}. No commander confirmation needed — the proposal itself is the confirmation gate.
+   - When Atif says "hold" / "reject" / "skip <id>", POST to crownkey_api action=marketing-hold with {proposal_id, reason}.
+   - When Atif says "edit <id> — drop X, add Y, change Z to N", POST to crownkey_api action=marketing-edit with {proposal_id, edits:{segments|total_count|notes}}.
+   - When Atif imperatively says "fire <template> to <N> <segment> NOW" outside the scheduled flow, call ceo_override({command_text}) — this pauses Director and routes through Marketing's override executor.
+   - When Director (or you) detect a template with no image, call marketing_request_creative({template_name, segment?, note?}). Then tell Atif which template needs an image and that he can upload directly to the Telegram chat with caption "for <template>".
+   - When you need a brand-new proposal off-schedule, call marketing_propose_batch({target_date, force:true}).`;
 
 const TOOLS = [
   { name: 'bash', description: 'Execute a bash command on the PA server. Use for: git operations, curl with custom headers/data, system inspection, anything not covered by other tools. Runs in the /app directory of the Railway container.', input_schema: { type: 'object', properties: { command: { type: 'string' }, timeout_s: { type: 'number', description: 'Timeout in seconds (default 30, max 120)' } }, required: ['command'] } },
@@ -427,6 +436,10 @@ const TOOLS = [
   { name: 'crm_lockdown_check', description: 'Verifies CRM lockdown compliance. Returns the daily summary of CRM writes — should always be INSERT-only into dbo.IntegratedLead. Reports: 24h CRM Bridge run count, 24h sql_violation count (always 0 if guardrail healthy), guardrail markers present, the 14 deleted high-risk workflows confirmed gone. Use when Atif asks about CRM compliance, lockdown status, whether anything has tried to violate the rule, or as part of the daily morning brief CRM Compliance section.', input_schema: { type: 'object', properties: {} } },
   { name: 'lead_intelligence_query', description: 'Read-only lead-database queries against crown_key_leads (the Phase 1 Lead Intelligence pool: HSBC, Crypto, ABU_DHABI, ARABIA, BECO etc). Use for questions like "how many HSBC leads do I have", "show top 50 most-validated leads", "look up phone +971501234567", "summary of CRYPTO category". Operations: count_by_category (no params), search_by_phone (param: phone), multi_source_top_n (param: n, default 50, max 100), recent_ingest_summary (param: hours, default 24), category_overview (param: category). Returns aggregated/scoped results, never bulk lead exports.', input_schema: { type: 'object', properties: { op: { type: 'string', enum: ['count_by_category', 'search_by_phone', 'multi_source_top_n', 'recent_ingest_summary', 'category_overview'] }, phone: { type: 'string', description: 'Required for search_by_phone (any format).' }, n: { type: 'integer', description: 'Optional for multi_source_top_n (default 50, max 100).' }, hours: { type: 'integer', description: 'Optional for recent_ingest_summary (default 24, max 168).' }, category: { type: 'string', description: 'Required for category_overview (e.g. HSBC, ABU_DHABI, CEO_CRYPTO, ARABIA, BECO).' } }, required: ['op'] } },
   { name: 'save_memory', description: 'Persist a structured memory imprint with explicit tags and key_facts. Use ONLY when Atif says "remember that...", "for next time...", or when you discover a fact worth tagging that the auto-save would not capture (a preference, a hard rule, a deal-specific number). Routine turns are saved automatically — do NOT call save_memory on every turn or you create duplicate rows. One imprint per memorable moment, max.', input_schema: { type: 'object', properties: { user_msg: { type: 'string', description: 'The user message or paraphrased context. Required.' }, assistant_msg: { type: 'string', description: 'Your reply or summary. Required.' }, tags: { type: 'array', items: { type: 'string' }, description: 'Optional explicit tags. Open vocabulary — pick whatever describes the imprint (e.g., ["preference","rule","deal:thevally11"]).' }, key_facts: { type: 'array', items: { type: 'string' }, description: 'Optional one-line facts the recall search should be able to surface verbatim.' } }, required: ['user_msg', 'assistant_msg'] } },
+  { name: 'marketing_get_today_plan', description: "Read-only — fetches the open Marketing Dept proposal for a target date (default = tomorrow). Returns the proposal_id, total_count, status, and the segments array (each with segment, count, template, creative_id, est_delivery). Use when Atif asks 'what is Marketing proposing', 'show me tomorrow plan', 'show the batch', or before he approves/holds/edits. Set include_history=true to also see rejected/completed proposals for that date.", input_schema: { type: 'object', properties: { target_date: { type: 'string', description: 'YYYY-MM-DD. Defaults to tomorrow (Dubai).' }, include_history: { type: 'boolean', description: 'Include rejected/completed proposals too. Default false (only open ones).' } } } },
+  { name: 'marketing_propose_batch', description: 'WRITE — force Marketing Dept to build a fresh proposal NOW (bypass the daily schedule). Use ONLY when Atif explicitly says "build me a plan", "propose a batch", or you have just rejected an open proposal and need a new one. With force=true, retires any open proposal for that target date before building. Returns the new proposal_id (or error) — Atif must then approve/hold/edit via the dedicated tools.', input_schema: { type: 'object', properties: { target_date: { type: 'string', description: 'YYYY-MM-DD. Defaults to tomorrow.' }, force: { type: 'boolean', description: 'If true, retires any open proposal for the date first. Default false.' } } } },
+  { name: 'marketing_request_creative', description: "WRITE — registers a pending creative slot when a template has no image. Use when Director or Atif identifies a template that needs an image before Marketing can include it in a batch. Inserts a row in campaign_creatives with status='pending' so Atif sees it in /marketing slot and uploads via Telegram. Idempotent: re-requesting the same (template,segment) just returns the existing pending id.", input_schema: { type: 'object', properties: { template_name: { type: 'string', description: 'Template name (e.g. open_dubai).' }, segment: { type: 'string', description: 'Optional segment/category. Defaults to ANY for template-wide.' }, note: { type: 'string', description: 'Optional one-line note about what kind of image is wanted.' } }, required: ['template_name'] } },
+  { name: 'ceo_override', description: "WRITE — emergency CEO override: sets system_signals.ceo_override_active=1 and enqueues an override command into ceo_override_queue. The next marketing-tick will pause normal Director flow and execute this override instead. Use when Atif says 'send X to Y now' or 'fire template Z to 500 HSBC leads tonight' — a single imperative override, not a scheduled batch. Pass action='clear_flag' to lift an override without enqueueing anything.", input_schema: { type: 'object', properties: { command_text: { type: 'string', description: 'Free-form override command (Marketing parses target+template+count).' }, action: { type: 'string', enum: ['set_flag', 'clear_flag'], description: 'Optional explicit flag op. Default = set_flag if command_text present, otherwise required.' } } } },
 ];
 
 async function tool_bash({ command, timeout_s = 30 }) {
@@ -1194,6 +1207,73 @@ async function tool_save_memory({ user_msg, assistant_msg, tags, key_facts }, ct
   }
 }
 
+// ===== Marketing Department tools (D3 — 2026-05-12) =====
+async function tool_marketing_get_today_plan({ target_date, include_history } = {}) {
+  const params = new URLSearchParams({ action: 'marketing-get-plan' });
+  if (target_date) params.set('target_date', String(target_date));
+  if (include_history) params.set('include_history', '1');
+  try {
+    const r = await fetchT(`${CK_BASE}?${params.toString()}`, { headers: ckHeaders() });
+    if (!r.ok) return { ok: false, error: `marketing_get_today_plan_http_${r.status}` };
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: 'marketing_get_today_plan_unreachable: ' + String(e.message || e) };
+  }
+}
+
+async function tool_marketing_propose_batch({ target_date, force } = {}) {
+  const body = {};
+  if (target_date) body.target_date = String(target_date);
+  if (force) body.force = true;
+  try {
+    const r = await fetchT(`${CK_BASE}?action=marketing-propose`, {
+      method: 'POST',
+      headers: { ...ckHeaders(), 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }, 60000);
+    if (!r.ok) return { ok: false, error: `marketing_propose_batch_http_${r.status}` };
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: 'marketing_propose_batch_unreachable: ' + String(e.message || e) };
+  }
+}
+
+async function tool_marketing_request_creative({ template_name, segment, note } = {}) {
+  if (!template_name) return { ok: false, error: 'template_name required' };
+  const body = { template_name: String(template_name) };
+  if (segment) body.segment = String(segment);
+  if (note) body.note = String(note);
+  try {
+    const r = await fetchT(`${CK_BASE}?action=marketing-request-creative`, {
+      method: 'POST',
+      headers: { ...ckHeaders(), 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) return { ok: false, error: `marketing_request_creative_http_${r.status}` };
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: 'marketing_request_creative_unreachable: ' + String(e.message || e) };
+  }
+}
+
+async function tool_ceo_override({ command_text, action } = {}) {
+  if (!command_text && !action) return { ok: false, error: 'command_text or action required' };
+  const body = {};
+  if (command_text) body.command_text = String(command_text);
+  if (action) body.action = String(action);
+  try {
+    const r = await fetchT(`${CK_BASE}?action=ceo-override`, {
+      method: 'POST',
+      headers: { ...ckHeaders(), 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) return { ok: false, error: `ceo_override_http_${r.status}` };
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: 'ceo_override_unreachable: ' + String(e.message || e) };
+  }
+}
+
 const TOOL_HANDLERS = {
   bash: tool_bash,
   read_file: tool_read_file,
@@ -1246,6 +1326,10 @@ const TOOL_HANDLERS = {
   save_memory: tool_save_memory,
   crm_lockdown_check: tool_crm_lockdown_check,
   lead_intelligence_query: tool_lead_intelligence_query,
+  marketing_get_today_plan: tool_marketing_get_today_plan,
+  marketing_propose_batch: tool_marketing_propose_batch,
+  marketing_request_creative: tool_marketing_request_creative,
+  ceo_override: tool_ceo_override,
 };
 
 // Conversation history store with TTL + LRU cap so arbitrary conversation_id values
