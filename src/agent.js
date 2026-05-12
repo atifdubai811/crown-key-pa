@@ -1515,7 +1515,41 @@ async function runAgentInner({ message, conversation_id = 'default', max_iterati
         messages,
       }, { signal: iterCtl.signal });
     } catch (e) {
-      return { error: String(e.message || e), iterations: iter, trace };
+      const msg = String(e?.message || e || '');
+      // B12-spam-fix (2026-05-12): detect Anthropic credits-low specifically so we
+      // can suppress reply entirely (no trivial-output placeholder spam) + write a
+      // single dept_inbox critical that PA Aggregator surfaces ONCE per briefing.
+      const creditsLow = /credit balance is too low|insufficient.*credit|billing/i.test(msg);
+      if (creditsLow) {
+        // Fire-and-forget dept_inbox emit so PA Briefing flags it next tick.
+        try {
+          if (CK_BASE && CK_TOKEN) {
+            fetchT(`${CK_BASE}?action=dept-inbox-emit`, {
+              method: 'POST',
+              headers: { ...ckHeaders(), 'content-type': 'application/json' },
+              body: JSON.stringify({
+                action: 'dept-inbox-emit',
+                dept: 'pa', severity: 'critical', category: 'anthropic_credits_exhausted',
+                message: '💳 Anthropic API returned credits-low error. Atlas reply suppressed. Top up at console.anthropic.com/settings/billing.',
+                payload: { conversation_id, error_excerpt: msg.slice(0, 200) },
+              }),
+            }, 5000).catch(() => {});
+          }
+        } catch (_) {}
+        console.error(`[agent] anthropic_credits_low for conv=${conversation_id} — reply suppressed (no Telegram-poisoning placeholder)`);
+        // Return a structured silent-error response. The n8n Telegram-PA workflow's
+        // Format Reply node already substitutes empty/dot answers, but here we
+        // explicitly DON'T set a placeholder — answer is the empty string, signaling
+        // upstream NOT to send any Telegram message at all.
+        return {
+          answer: '',
+          iterations: iter,
+          trace,
+          credits_exhausted: true,
+          telegram_suppress: true,
+        };
+      }
+      return { error: msg, iterations: iter, trace };
     } finally {
       clearTimeout(iterTimeout);
       if (abortSignal) abortSignal.removeEventListener('abort', forwardAbort);
