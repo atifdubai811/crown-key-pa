@@ -1523,11 +1523,31 @@ async function runAgentInner({ message, conversation_id = 'default', max_iterati
     messages.push({ role: 'assistant', content: response.content });
 
     if (response.stop_reason === 'end_turn') {
+      const text = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+      // Trivial-output guard (added 2026-05-12 after the "." feedback-loop incident):
+      // When the model returns an empty or near-empty reply (≤2 chars, often "." or "ok"
+      // alone) AND no tool was called this turn, do NOT persist the assistant message
+      // back into history. Persisting it would teach the model to repeat the same
+      // single-character answer next turn, locking the conversation into a degenerate
+      // loop. Instead, save history excluding this final assistant turn so the next
+      // user message gets a fresh attempt, and return a stable placeholder Telegram
+      // can safely render (Telegram rejects empty / pure-whitespace bodies).
+      const cleanedText = String(text || '').trim();
+      if (cleanedText.length <= 2 && trace.length === 0) {
+        const beforeFinal = messages.slice(0, -1); // drop the trivial assistant turn
+        setConversationMessages(conversation_id, beforeFinal);
+        console.warn(`[agent] trivial end_turn answer suppressed (text=${JSON.stringify(text)}) for conv=${conversation_id} — not persisting`);
+        return {
+          answer: 'I came back with nothing useful — let me try again, can you rephrase?',
+          iterations: iter,
+          trace,
+          trivial_suppressed: true,
+        };
+      }
       // setConversationMessages now handles pairing-aware trimming internally.
       // Pre-2026-05-12 this used messages.slice(-30) which could leave an
       // orphan tool_result at position 0 when a pair straddled the trim point.
       setConversationMessages(conversation_id, messages);
-      const text = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
       return { answer: text, iterations: iter, trace };
     }
 
