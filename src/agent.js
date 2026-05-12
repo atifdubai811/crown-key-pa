@@ -1353,14 +1353,115 @@ function getConversationMessages(id) {
   return entry.messages;
 }
 
+// Walk forward from the natural slice point until we land on a message that is
+// safe to start a conversation with. Specifically: drop leading messages that
+// would create an orphan tool_use_id error against the Anthropic API:
+//   1. user message containing a tool_result block (parent tool_use trimmed away)
+//   2. assistant message with tool_use blocks whose tool_result didn't survive
+// Returns a slice of arr beginning at a safe boundary, of length ≤ target.
+function alignSliceForPairing(arr, target) {
+  let startIdx = Math.max(0, arr.length - target);
+  while (startIdx < arr.length) {
+    const m = arr[startIdx];
+    const content = Array.isArray(m.content) ? m.content : [];
+    // Case 1: user-with-tool_result at the top → orphan, skip it.
+    if (m.role === 'user' && content.some(b => b && b.type === 'tool_result')) {
+      startIdx++;
+      continue;
+    }
+    // Case 2: assistant-with-tool_use → next msg must contain matching tool_result IDs.
+    if (m.role === 'assistant' && content.some(b => b && b.type === 'tool_use')) {
+      const useIds = content.filter(b => b && b.type === 'tool_use').map(b => b.id);
+      const next = arr[startIdx + 1];
+      const nextContent = Array.isArray(next && next.content) ? next.content : [];
+      const nextResultIds = new Set(nextContent.filter(b => b && b.type === 'tool_result').map(b => b.tool_use_id));
+      if (!useIds.every(id => nextResultIds.has(id))) {
+        startIdx++;
+        continue;
+      }
+    }
+    break;
+  }
+  return arr.slice(startIdx);
+}
+
+// Defensive check — scan the array for any tool_use without a matching tool_result
+// in the IMMEDIATELY following user message (or vice versa). Returns issues array.
+function validatePairing(arr) {
+  const issues = [];
+  for (let i = 0; i < arr.length; i++) {
+    const m = arr[i];
+    const content = Array.isArray(m.content) ? m.content : [];
+    if (m.role === 'assistant') {
+      const useIds = content.filter(b => b && b.type === 'tool_use').map(b => b.id);
+      if (useIds.length > 0) {
+        const next = arr[i + 1];
+        const nextContent = Array.isArray(next && next.content) ? next.content : [];
+        const resultIds = new Set(nextContent.filter(b => b && b.type === 'tool_result').map(b => b.tool_use_id));
+        for (const id of useIds) if (!resultIds.has(id)) issues.push({ index: i, kind: 'orphan_tool_use', id });
+      }
+    } else if (m.role === 'user') {
+      const resultIds = content.filter(b => b && b.type === 'tool_result').map(b => b.tool_use_id);
+      if (resultIds.length > 0) {
+        const prev = arr[i - 1];
+        const prevContent = Array.isArray(prev && prev.content) ? prev.content : [];
+        const useIds = new Set(prevContent.filter(b => b && b.type === 'tool_use').map(b => b.id));
+        for (const id of resultIds) if (!useIds.has(id)) issues.push({ index: i, kind: 'orphan_tool_result', id });
+      }
+    }
+  }
+  return issues;
+}
+
+// Fire-and-forget: tell dept_inbox the PA almost persisted corrupted state.
+async function reportPairingCorruption(conversationId, issues) {
+  try {
+    if (!CK_BASE || !CK_TOKEN) return;
+    const payload = {
+      action: 'dept-inbox-emit',
+      dept: 'pa',
+      severity: 'critical',
+      category: 'pairing_corruption_blocked',
+      message: `Atlas conversation_id=${conversationId} would have persisted ${issues.length} tool_use/tool_result orphan(s) — write rejected, previous valid state retained.`,
+      payload: { conversation_id: conversationId, issues: issues.slice(0, 8) },
+    };
+    await fetchT(`${CK_BASE}?action=dept-inbox-emit`, {
+      method: 'POST',
+      headers: { ...ckHeaders(), 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    }, 5000);
+  } catch (e) {
+    console.error('reportPairingCorruption: fetch failed:', e && (e.message || e));
+  }
+}
+
 function setConversationMessages(id, messages) {
+  // 1. Trim with pairing-aware alignment (preventive — pre-2026-05-12 bug fix).
+  let safe = alignSliceForPairing(messages, 30);
+  // 2. Defensive end-to-end validation. If alignment didn't fully recover, REJECT
+  //    the write so the previous (valid) state is preserved. Log to dept_inbox.
+  const issues = validatePairing(safe);
+  if (issues.length > 0) {
+    console.error(`[conversation] REJECT write for ${id}: ${issues.length} pairing issue(s). First: ${JSON.stringify(issues[0])}`);
+    queueMicrotask(() => reportPairingCorruption(id, issues));
+    return; // leave existing state untouched
+  }
   conversations.delete(id); // ensure re-insertion places this at the LRU tail
-  conversations.set(id, { messages, ts: Date.now() });
+  conversations.set(id, { messages: safe, ts: Date.now() });
   while (conversations.size > CONVERSATION_MAX) {
     const oldest = conversations.keys().next().value;
     if (oldest === undefined) break;
     conversations.delete(oldest);
   }
+}
+
+// Admin: drop the in-memory conversation history for one id. Used by
+// POST /admin/clear-conversation. Returns true if a row existed, false if not.
+export function clearConversation(id) {
+  const had = conversations.has(id);
+  conversations.delete(id);
+  conversationChains.delete(id);
+  return had;
 }
 
 // Serialize concurrent /agent calls that share a conversation_id. Without this, two
@@ -1422,7 +1523,10 @@ async function runAgentInner({ message, conversation_id = 'default', max_iterati
     messages.push({ role: 'assistant', content: response.content });
 
     if (response.stop_reason === 'end_turn') {
-      setConversationMessages(conversation_id, messages.slice(-30));
+      // setConversationMessages now handles pairing-aware trimming internally.
+      // Pre-2026-05-12 this used messages.slice(-30) which could leave an
+      // orphan tool_result at position 0 when a pair straddled the trim point.
+      setConversationMessages(conversation_id, messages);
       const text = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
       return { answer: text, iterations: iter, trace };
     }

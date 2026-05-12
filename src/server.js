@@ -1,7 +1,7 @@
 // Crown Key PA — always-on cloud brain (Claude Agent SDK)
 import express from 'express';
 import cors from 'cors';
-import { runAgent } from './agent.js';
+import { runAgent, clearConversation } from './agent.js';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 
@@ -262,6 +262,19 @@ app.post('/agent', requireAuth, async (req, res) => {
     log('agent error:', e);
     if (!res.writableEnded) res.status(500).json({ error: 'agent_failed' });
   }
+});
+
+// Admin: drop the in-memory conversation history for one id (and its serialization
+// chain) so the next /agent call starts fresh. Used when Anthropic returns
+// "unexpected tool_use_id" corruption — a per-conversation alternative to a full
+// Railway redeploy. Bearer auth via the same PA_API_TOKEN.
+//   POST /admin/clear-conversation  { conversation_id: "telegram-6501185066" }
+app.post('/admin/clear-conversation', requireAuth, async (req, res) => {
+  const id = String(req.body?.conversation_id || req.query?.conversation_id || '').trim();
+  if (!id) return res.status(400).json({ ok: false, error: 'conversation_id required' });
+  const cleared = clearConversation(id);
+  log(`admin: clear-conversation id=${id} had_existing_state=${cleared}`);
+  return res.json({ ok: true, conversation_id: id, had_existing_state: cleared });
 });
 
 // Marketing Dept — Telegram media intake (D5, 2026-05-12)
