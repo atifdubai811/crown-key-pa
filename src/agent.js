@@ -1524,24 +1524,48 @@ async function runAgentInner({ message, conversation_id = 'default', max_iterati
 
     if (response.stop_reason === 'end_turn') {
       const text = response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-      // Trivial-output guard (added 2026-05-12 after the "." feedback-loop incident):
-      // When the model returns an empty or near-empty reply (≤2 chars, often "." or "ok"
-      // alone) AND no tool was called this turn, do NOT persist the assistant message
-      // back into history. Persisting it would teach the model to repeat the same
-      // single-character answer next turn, locking the conversation into a degenerate
-      // loop. Instead, save history excluding this final assistant turn so the next
-      // user message gets a fresh attempt, and return a stable placeholder Telegram
-      // can safely render (Telegram rejects empty / pure-whitespace bodies).
+      // Trivial-output guard — broadened 2026-05-12 (19:00 GST) after a "No." loop
+      // slipped past the original ≤2-char threshold. The earlier "." loop was the
+      // narrowest case; this turn we hit "No." (3 chars) which is just as useless
+      // when Atif is asking a real question. New rule: if no tool was called AND
+      // the response is either ≤5 chars OR matches a tiny-reply allowlist, treat
+      // it as trivial and refuse to persist.
       const cleanedText = String(text || '').trim();
-      if (cleanedText.length <= 2 && trace.length === 0) {
+      const trivialRx = /^(no|yes|nope|yep|ok|okay|same|done|sure|maybe|fine|thanks|noted|hmm|kinda|right|wrong|true|false|got it|on it)\s*[.!?]*\s*$/i;
+      const isTrivial = trace.length === 0
+        && (cleanedText.length <= 5 || trivialRx.test(cleanedText));
+      if (isTrivial) {
         const beforeFinal = messages.slice(0, -1); // drop the trivial assistant turn
-        setConversationMessages(conversation_id, beforeFinal);
-        console.warn(`[agent] trivial end_turn answer suppressed (text=${JSON.stringify(text)}) for conv=${conversation_id} — not persisting`);
+        // Refusal-loop detector: if the previous 4 messages were also user-message
+        // → trivial-assistant pairs that look similar to this one, the model is
+        // stuck in a "shut up" loop. Aggressively clear the recent history so the
+        // model gets a fresh view on the next user message.
+        const recent = beforeFinal.slice(-6);
+        let trivialPairs = 0;
+        for (let i = recent.length - 1; i >= 1; i -= 2) {
+          const a = recent[i];
+          if (!a || a.role !== 'assistant') break;
+          const aText = (a.content || []).filter(b => b && b.type === 'text').map(b => b.text).join('').trim();
+          if (aText.length > 5 && !trivialRx.test(aText)) break;
+          trivialPairs++;
+        }
+        let saveHistory = beforeFinal;
+        if (trivialPairs >= 2) {
+          // Drop the last 6 turns (3 user/assistant pairs) entirely — the trivial-reply
+          // pattern in history is poisoning the model's next-turn decision.
+          saveHistory = beforeFinal.slice(0, -6);
+          console.warn(`[agent] refusal-loop detected for conv=${conversation_id} (trivialPairs=${trivialPairs}) — dropping last 6 turns from history`);
+        }
+        setConversationMessages(conversation_id, saveHistory);
+        console.warn(`[agent] trivial end_turn answer suppressed (text=${JSON.stringify(text)}) for conv=${conversation_id} — not persisting; trivialPairs=${trivialPairs}`);
         return {
-          answer: 'I came back with nothing useful — let me try again, can you rephrase?',
+          answer: trivialPairs >= 2
+            ? `I keep coming back with "${cleanedText}" which isn't useful. Ask me a specific question — "how many sends today" or "what's WABA doing" — and I'll give you real numbers.`
+            : 'I came back with nothing useful — let me try again, can you rephrase?',
           iterations: iter,
           trace,
           trivial_suppressed: true,
+          loop_break: trivialPairs >= 2,
         };
       }
       // setConversationMessages now handles pairing-aware trimming internally.
