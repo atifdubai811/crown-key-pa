@@ -477,6 +477,9 @@ const TOOLS = [
   { name: 'workflow_resurrection_pause', description: 'WRITE — pauses the Workflow Resurrection agent for N minutes by setting a TTL signal it honors. Use when you\'re about to deactivate a workflow intentionally and don\'t want the agent to revive it during the work window. Returns: paused_until (UTC ISO).', input_schema: { type: 'object', properties: { minutes: { type: 'integer', description: 'How long to pause (1–180). Default 30.' }, reason: { type: 'string' } }, required: ['reason'] } },
   { name: 'workflow_resurrection_resume', description: 'WRITE — immediately resumes Workflow Resurrection (clears the pause signal). Use to undo a pause early.', input_schema: { type: 'object', properties: {} } },
   { name: 'pull_n8n_status', description: 'READ — summary of all n8n workflows: active count, last execution per workflow, any that errored on last run, any intentionally-deactivated. Use when Atif asks "what\'s running" or "are all the depts healthy". Returns a structured list, not a free-form blob.', input_schema: { type: 'object', properties: {} } },
+  // ===== Block 14 (2026-05-13) — Template Library =====
+  { name: 'marketing_list_all_templates', description: 'READ — lists every marketing template in WhatsJet (sourced from Meta WABA registry, not campaign history). 49 templates total. Each returns: template_name, language, status, community_hint (parsed from name: Nad Al Sheba, District One, The Valley, Standpoint, Opera Grand, Princess Tower, Burj Lake, Address Blvd, Act Tower, Sky View, St Regis, IL Primo, Oasis, Grande Meydan, Boulevard Point, Downtown, etc.), last_fired_at, days_since_fired, never_fired, sent_30d, delivery_rate_30d, is_disabled, has_creative, freshness_score. Use when Atif asks "show me virgin templates", "what templates do we have by community", "what haven\'t we fired yet". Default sort: freshness_score DESC (never-fired beats long-ago-fired beats recently-fired).', input_schema: { type: 'object', properties: { filter: { type: 'string', enum: ['active','disabled','never_fired','all'], description: 'Default all.' }, sort_by: { type: 'string', enum: ['freshness','name','delivery','last_fired'], description: 'Default freshness.' }, community_hint: { type: 'string', description: 'Filter to one community (e.g. "Opera Grand", "The Valley").' } } } },
+  { name: 'marketing_recommend_template_for_segment', description: "WRITE-SUGGEST — for a given segment (DAMAC_LAGOONS, HSBC, CEO_CRYPTO, ARABIA_BUSINESS, ABU_DHABI, BECO), returns top 3 template candidates ranked by composite score: seeded/Atif-locked affinity + never_fired (+100) + meta_eligible (+50) + has_creative (+30) + recent delivery >70% (+20) - weak_delivery <30% (-30). Includes plain-English reasoning for each pick. Use when Atif asks 'recommend a template for X', 'what should I send to HSBC tomorrow', or before building a proposal manually.", input_schema: { type: 'object', properties: { segment_name: { type: 'string' } }, required: ['segment_name'] } },
 ];
 
 async function tool_bash({ command, timeout_s = 30 }) {
@@ -1389,6 +1392,19 @@ async function tool_pull_n8n_status() {
   return _ckGet('n8n-status-overview', {}, 'pull_n8n_status');
 }
 
+async function tool_marketing_list_all_templates({ filter, sort_by, community_hint } = {}) {
+  const params = {};
+  if (filter) params.filter = String(filter);
+  if (sort_by) params.sort_by = String(sort_by);
+  if (community_hint) params.community_hint = String(community_hint);
+  return _ckGet('template-list', params, 'marketing_list_all_templates');
+}
+
+async function tool_marketing_recommend_template_for_segment({ segment_name } = {}) {
+  if (!segment_name) return { ok: false, error: 'segment_name required' };
+  return _ckGet('template-recommend-for-segment', { segment: String(segment_name) }, 'marketing_recommend_template_for_segment');
+}
+
 const TOOL_HANDLERS = {
   bash: tool_bash,
   read_file: tool_read_file,
@@ -1455,6 +1471,9 @@ const TOOL_HANDLERS = {
   workflow_resurrection_pause: tool_workflow_resurrection_pause,
   workflow_resurrection_resume: tool_workflow_resurrection_resume,
   pull_n8n_status: tool_pull_n8n_status,
+  // Block 14 (2026-05-13) — Template Library
+  marketing_list_all_templates: tool_marketing_list_all_templates,
+  marketing_recommend_template_for_segment: tool_marketing_recommend_template_for_segment,
 };
 
 // Conversation history store with TTL + LRU cap so arbitrary conversation_id values
