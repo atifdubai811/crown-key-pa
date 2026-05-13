@@ -925,7 +925,54 @@ function senderControlDryRunBody(op, input = {}) {
   return { ...input, op, dry_run: true };
 }
 
+// 2026-05-13 — pre-check helper. Before any sender mutation, Atlas asks
+// sender-health which sender is currently in what state and short-circuits
+// when the proposed change is a no-op. Stops the "rotate sender 925"
+// confirmation tokens from being generated when Audit already paused 925
+// hours earlier.
+async function getSenderCurrentState(sender_id) {
+  if (!sender_id) return null;
+  try {
+    const health = await tool_crownkey_api({ action: 'sender-health' });
+    const senders = Array.isArray(health?.senders) ? health.senders : [];
+    const want = String(sender_id);
+    const match = senders.find((s) => String(s.phone_number_id) === want);
+    if (!match) return { found: false, sender_id: want };
+    return {
+      found: true,
+      sender_id: want,
+      manually_disabled: !!match.manually_disabled,
+      effective_status: match.effective_status, // 'active' | 'disabled' | ...
+      meta_quality: match?.meta?.meta_quality || null,
+      display: match.display || null,
+      last_meta_sync: match?.meta?.last_meta_sync || null,
+      auto_health: match.auto_health || null,
+      // raw bag so the LLM can phrase it in Atlas voice
+      raw: match,
+    };
+  } catch (e) {
+    return { found: false, error: String(e?.message || e), sender_id: String(sender_id) };
+  }
+}
+
 async function tool_sender_disable({ sender_id, reason, dry_run = true } = {}) {
+  // Pre-check: if this sender is already disabled, don't generate a
+  // confirmation token — just report current state and let Atlas phrase it.
+  const cur = await getSenderCurrentState(sender_id);
+  if (cur?.found && (cur.manually_disabled || cur.effective_status === 'disabled')) {
+    return {
+      ok: false,
+      already_disabled: true,
+      sender_id: String(sender_id),
+      current_status: cur.effective_status,
+      manually_disabled: cur.manually_disabled,
+      meta_quality: cur.meta_quality,
+      last_meta_sync: cur.last_meta_sync,
+      display: cur.display,
+      message: `Sender ${sender_id} is already disabled (${cur.effective_status}${cur.manually_disabled ? ', manually_disabled=true' : ''}). No action proposed — no rotation needed.`,
+      hint: 'If you want to confirm who disabled it and when, query the Audit dept_inbox or sender-health full record.',
+    };
+  }
   const body = { op: 'sender_disable', sender_id, reason };
   if (dry_run !== false) {
     return tool_crownkey_api({ action: 'atlas-sender-control', method: 'POST', body: senderControlDryRunBody('sender_disable', body) });
@@ -959,16 +1006,35 @@ async function tool_sender_enable({ sender_id, dry_run = true } = {}) {
 
 async function tool_sender_rotate({ dry_run = true } = {}) {
   const body = { op: 'sender_rotate' };
-  if (dry_run !== false) {
-    return tool_crownkey_api({ action: 'atlas-sender-control', method: 'POST', body: senderControlDryRunBody('sender_rotate', body) });
-  }
+  // Run the dry-run preview first so we know which sender would be disabled.
   const preview = await tool_crownkey_api({ action: 'atlas-sender-control', method: 'POST', body: senderControlDryRunBody('sender_rotate', body) });
   if (preview?.ok === false) return preview;
-  const deact = preview?.preview?.deactivate_sender || 'unknown';
+  const deact = preview?.preview?.deactivate_sender;
+  // 2026-05-13 — pre-check: if the sender that would be disabled is ALREADY
+  // disabled, the rotation is a no-op. Skip and report current state instead
+  // of generating a token Atif then has to dismiss.
+  if (deact && deact !== 'unknown') {
+    const cur = await getSenderCurrentState(deact);
+    if (cur?.found && (cur.manually_disabled || cur.effective_status === 'disabled')) {
+      return {
+        ok: false,
+        already_handled: true,
+        sender_id: String(deact),
+        current_status: cur.effective_status,
+        manually_disabled: cur.manually_disabled,
+        meta_quality: cur.meta_quality,
+        last_meta_sync: cur.last_meta_sync,
+        display: cur.display,
+        message: `No rotation needed. Sender ${deact} (the weakest in the pool) is already disabled (${cur.effective_status}). The pool is already in the post-rotation state.`,
+        hint: 'If a different sender needs attention, query sender-health for the full pool and propose explicitly.',
+      };
+    }
+  }
+  if (dry_run !== false) return preview;
   const act = preview?.preview?.activate_sender || 'no replacement';
   return queueCommanderAction({
     tool: 'sender_rotate',
-    summary: `Rotate sender pool: disable ${deact}; activate ${act}.`,
+    summary: `Rotate sender pool: disable ${deact || 'unknown'}; activate ${act}.`,
     action: 'atlas-sender-control',
     body,
     preview,
