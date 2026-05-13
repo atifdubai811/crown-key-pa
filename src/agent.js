@@ -383,7 +383,32 @@ OPERATING RULES:
    - When Atif says "edit <id> — drop X, add Y, change Z to N", POST to crownkey_api action=marketing-edit with {proposal_id, edits:{segments|total_count|notes}}.
    - When Atif imperatively says "fire <template> to <N> <segment> NOW" outside the scheduled flow, call ceo_override({command_text}) — this pauses Director and routes through Marketing's override executor.
    - When Director (or you) detect a template with no image, call marketing_request_creative({template_name, segment?, note?}). Then tell Atif which template needs an image and that he can upload directly to the Telegram chat with caption "for <template>".
-   - When you need a brand-new proposal off-schedule, call marketing_propose_batch({target_date, force:true}).`;
+   - When you need a brand-new proposal off-schedule, call marketing_propose_batch({target_date, force:true}).
+
+=== OPERATIONAL AUTONOMY (Block 13, 2026-05-13) ===
+
+You are Atif's full operational PA. When he asks you to do something, you DO it — you don't tell him to message Claude Code or open hPanel. Use the tools you have. If you genuinely don't have a tool for a task, say so plainly and offer to flag it for the Claude Code build queue.
+
+Dedicated tools exist for everything below. Use them — don't fall back to bash + curl + raw API calls when a named tool already wraps it:
+- Previews / sample sends → marketing_send_preview_to_atif (Atif-phone bypass is built-in, logged in dept_inbox, restoration automatic)
+- Approval buttons → marketing_send_approval_buttons (Approve / Hold / Edit inline keyboard, wired to telegram-callback)
+- Template controls → marketing_clear_template_disable, marketing_set_template_disable
+- Stats → marketing_pull_campaign_stats (single campaign OR template over a window)
+- Department toggles → recovery_pause, recovery_resume, pause_dept, resume_dept
+- Workflow management → workflow_resurrection_pause / workflow_resurrection_resume, sales_workflow_fix
+- System overview → pull_n8n_status, fetch_handbook
+- Inbox / events → dept_inbox_recent, read_dept_inbox
+
+For routine ops — daily approvals, status checks, stat lookups, template control — just execute and report briefly. No friction.
+
+For destructive or sensitive actions (clearing template disables, overriding Atif-phone-protection, mass changes, deactivating workflows, freezing the system), call propose_action first or confirm in your text response before executing. The threshold: would Atif want a second to think about this? If yes, ask once.
+
+When the underlying system genuinely fails (Atlas brain unreachable, n8n down, DB error), say so plainly with the error message. Don't pretend success.
+
+=== TIME FORMATTING — strict rule ===
+
+Always display times in Dubai 12-hour AM/PM. "6:30 PM Dubai", "9:00 AM Dubai", "in 4 hours".
+Never use 24-hour, GST, GMT+4, or UTC in user-facing replies. Internally tools may return UTC — convert before answering.`;
 
 const TOOLS = [
   { name: 'bash', description: 'Execute a bash command on the PA server. Use for: git operations, curl with custom headers/data, system inspection, anything not covered by other tools. Runs in the /app directory of the Railway container.', input_schema: { type: 'object', properties: { command: { type: 'string' }, timeout_s: { type: 'number', description: 'Timeout in seconds (default 30, max 120)' } }, required: ['command'] } },
@@ -441,6 +466,17 @@ const TOOLS = [
   { name: 'marketing_propose_batch', description: 'WRITE — force Marketing Dept to build a fresh proposal NOW (bypass the daily schedule). Use ONLY when Atif explicitly says "build me a plan", "propose a batch", or you have just rejected an open proposal and need a new one. With force=true, retires any open proposal for that target date before building. Returns the new proposal_id (or error) — Atif must then approve/hold/edit via the dedicated tools.', input_schema: { type: 'object', properties: { target_date: { type: 'string', description: 'YYYY-MM-DD. Defaults to tomorrow.' }, force: { type: 'boolean', description: 'If true, retires any open proposal for the date first. Default false.' } } } },
   { name: 'marketing_request_creative', description: "WRITE — registers a pending creative slot when a template has no image. Use when Director or Atif identifies a template that needs an image before Marketing can include it in a batch. Inserts a row in campaign_creatives with status='pending' so Atif sees it in /marketing slot and uploads via Telegram. Idempotent: re-requesting the same (template,segment) just returns the existing pending id.", input_schema: { type: 'object', properties: { template_name: { type: 'string', description: 'Template name (e.g. open_dubai).' }, segment: { type: 'string', description: 'Optional segment/category. Defaults to ANY for template-wide.' }, note: { type: 'string', description: 'Optional one-line note about what kind of image is wanted.' } }, required: ['template_name'] } },
   { name: 'ceo_override', description: "WRITE — emergency CEO override: sets system_signals.ceo_override_active=1 and enqueues an override command into ceo_override_queue. The next marketing-tick will pause normal Director flow and execute this override instead. Use when Atif says 'send X to Y now' or 'fire template Z to 500 HSBC leads tonight' — a single imperative override, not a scheduled batch. Pass action='clear_flag' to lift an override without enqueueing anything.", input_schema: { type: 'object', properties: { command_text: { type: 'string', description: 'Free-form override command (Marketing parses target+template+count).' }, action: { type: 'string', enum: ['set_flag', 'clear_flag'], description: 'Optional explicit flag op. Default = set_flag if command_text present, otherwise required.' } } } },
+
+  // ===== Block 13 (2026-05-13) — operational autonomy tools =====
+  { name: 'marketing_send_preview_to_atif', description: 'WRITE — sends ONE rendered template message to a phone (default = Atif 971558998452) by enqueueing a single-recipient campaign through WhatsJet via the same path the WhatsJet UI uses. Use when Atif asks for a preview before approval, or wants to see the rendered message before committing. Atif-phone-protection is bypassed only for this preview send and logged in dept_inbox both before and after. Pass proposal_id (defaults to today\'s pending) to auto-resolve template + image + sender. Returns: campaign_id, queue_id, recipient, image_url.', input_schema: { type: 'object', properties: { proposal_id: { type: 'integer', description: 'Marketing proposal_id (default = today pending).' }, recipient_phone: { type: 'string', description: 'Recipient (default = 971558998452 Atif protected — override). No + prefix.' }, segment_index: { type: 'integer', description: 'Which segment to preview if multi-segment proposal (default 0).' } } } },
+  { name: 'marketing_send_approval_buttons', description: 'WRITE — sends a fresh Telegram message to Atif with an Approve/Hold/Edit inline keyboard for a marketing proposal. Buttons wire to the existing telegram-callback handler (mk_approve:<id>, mk_hold:<id>, mk_edit:<id>). Use when Atif asks "send me the approve buttons again" or after editing a proposal. Returns: telegram_message_id.', input_schema: { type: 'object', properties: { proposal_id: { type: 'integer', description: 'The marketing proposal_id. Defaults to today\'s open proposal.' } } } },
+  { name: 'marketing_clear_template_disable', description: 'WRITE — clears meta_template_state.disabled_until + disabled_reason for a template, allowing Director to use it again. Use when Atif wants to re-enable a template Director paused (typically after he\'s reviewed its recent stats or uploaded a fresh creative). dept_inbox-logged with reason. Returns: rows_affected, previous_disable_until.', input_schema: { type: 'object', properties: { template_name: { type: 'string' }, reason: { type: 'string', description: 'Why Atif is re-enabling (free-form).' } }, required: ['template_name', 'reason'] } },
+  { name: 'marketing_set_template_disable', description: 'WRITE — sets meta_template_state.disabled_until = now + N days for a template, blocking Director from picking it. Use when Atif wants to pause a template manually (e.g., its delivery just tanked). dept_inbox-logged.', input_schema: { type: 'object', properties: { template_name: { type: 'string' }, days: { type: 'integer', description: 'Disable duration in days (1–60).' }, reason: { type: 'string' } }, required: ['template_name', 'days', 'reason'] } },
+  { name: 'marketing_pull_campaign_stats', description: 'READ — pulls full stats for a campaign (by campaign_id OR template_name + window). Returns sent/delivered/read/failed counts, computed delivery%, fail%, reply rate. Tenant-filtered. Use when Atif asks "how is CMP_X doing" or "open_dubai 7-day performance".', input_schema: { type: 'object', properties: { campaign_id: { type: 'integer' }, template_name: { type: 'string' }, since_days: { type: 'integer', description: 'Lookback window in days (default 7, max 90). Only with template_name.' } } } },
+  { name: 'sales_workflow_fix', description: 'READ + diagnostic — checks Sales workflow state (n8n cron, CLI runner cron, recent error pattern, last successful run). Returns a recommendation: restart_workflow / mark_intentionally_deactivated / cli_runner_path_is_fine. Use when Atif asks "why isn\'t Sales firing" or after Sales has been silent. NEVER writes — surfaces the diagnosis so Atif decides.', input_schema: { type: 'object', properties: {} } },
+  { name: 'workflow_resurrection_pause', description: 'WRITE — pauses the Workflow Resurrection agent for N minutes by setting a TTL signal it honors. Use when you\'re about to deactivate a workflow intentionally and don\'t want the agent to revive it during the work window. Returns: paused_until (UTC ISO).', input_schema: { type: 'object', properties: { minutes: { type: 'integer', description: 'How long to pause (1–180). Default 30.' }, reason: { type: 'string' } }, required: ['reason'] } },
+  { name: 'workflow_resurrection_resume', description: 'WRITE — immediately resumes Workflow Resurrection (clears the pause signal). Use to undo a pause early.', input_schema: { type: 'object', properties: {} } },
+  { name: 'pull_n8n_status', description: 'READ — summary of all n8n workflows: active count, last execution per workflow, any that errored on last run, any intentionally-deactivated. Use when Atif asks "what\'s running" or "are all the depts healthy". Returns a structured list, not a free-form blob.', input_schema: { type: 'object', properties: {} } },
 ];
 
 async function tool_bash({ command, timeout_s = 30 }) {
@@ -1275,6 +1311,84 @@ async function tool_ceo_override({ command_text, action } = {}) {
   }
 }
 
+// ===== Block 13 (2026-05-13) — operational autonomy tool handlers =====
+// All thin wrappers around new n8n-stats.php endpoints. Auth/CSRF handled
+// by ckHeaders() upstream. Each follows the same error-shape convention
+// as the existing tools.
+
+async function _ckPost(action, body, errorPrefix) {
+  try {
+    const r = await fetchT(`${CK_BASE}?action=${action}`, {
+      method: 'POST',
+      headers: { ...ckHeaders(), 'content-type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    }, 30000);
+    if (!r.ok) return { ok: false, error: `${errorPrefix}_http_${r.status}` };
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: `${errorPrefix}_unreachable: ${String(e.message || e)}` };
+  }
+}
+
+async function _ckGet(action, params, errorPrefix) {
+  const qs = new URLSearchParams({ action, ...(params || {}) });
+  try {
+    const r = await fetchT(`${CK_BASE}?${qs.toString()}`, { headers: ckHeaders() }, 30000);
+    if (!r.ok) return { ok: false, error: `${errorPrefix}_http_${r.status}` };
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: `${errorPrefix}_unreachable: ${String(e.message || e)}` };
+  }
+}
+
+async function tool_marketing_send_preview_to_atif(input = {}) {
+  return _ckPost('marketing-send-preview', input, 'marketing_send_preview');
+}
+
+async function tool_marketing_send_approval_buttons(input = {}) {
+  return _ckPost('marketing-send-approval-buttons', input, 'marketing_send_approval_buttons');
+}
+
+async function tool_marketing_clear_template_disable({ template_name, reason } = {}) {
+  if (!template_name) return { ok: false, error: 'template_name required' };
+  if (!reason) return { ok: false, error: 'reason required' };
+  return _ckPost('marketing-clear-template-disable', { template_name, reason }, 'marketing_clear_template_disable');
+}
+
+async function tool_marketing_set_template_disable({ template_name, days, reason } = {}) {
+  if (!template_name) return { ok: false, error: 'template_name required' };
+  if (!days || days < 1 || days > 60) return { ok: false, error: 'days must be 1–60' };
+  if (!reason) return { ok: false, error: 'reason required' };
+  return _ckPost('marketing-set-template-disable', { template_name, days, reason }, 'marketing_set_template_disable');
+}
+
+async function tool_marketing_pull_campaign_stats({ campaign_id, template_name, since_days } = {}) {
+  if (!campaign_id && !template_name) return { ok: false, error: 'campaign_id or template_name required' };
+  const params = {};
+  if (campaign_id) params.campaign_id = String(campaign_id);
+  if (template_name) params.template_name = String(template_name);
+  if (since_days) params.since_days = String(Math.min(90, Math.max(1, since_days)));
+  return _ckGet('marketing-campaign-stats', params, 'marketing_pull_campaign_stats');
+}
+
+async function tool_sales_workflow_fix() {
+  return _ckGet('sales-workflow-diagnose', {}, 'sales_workflow_fix');
+}
+
+async function tool_workflow_resurrection_pause({ minutes, reason } = {}) {
+  if (!reason) return { ok: false, error: 'reason required' };
+  const m = Math.min(180, Math.max(1, minutes || 30));
+  return _ckPost('workflow-resurrection-pause', { minutes: m, reason }, 'workflow_resurrection_pause');
+}
+
+async function tool_workflow_resurrection_resume() {
+  return _ckPost('workflow-resurrection-resume', {}, 'workflow_resurrection_resume');
+}
+
+async function tool_pull_n8n_status() {
+  return _ckGet('n8n-status-overview', {}, 'pull_n8n_status');
+}
+
 const TOOL_HANDLERS = {
   bash: tool_bash,
   read_file: tool_read_file,
@@ -1331,6 +1445,16 @@ const TOOL_HANDLERS = {
   marketing_propose_batch: tool_marketing_propose_batch,
   marketing_request_creative: tool_marketing_request_creative,
   ceo_override: tool_ceo_override,
+  // Block 13 (2026-05-13) — operational autonomy
+  marketing_send_preview_to_atif: tool_marketing_send_preview_to_atif,
+  marketing_send_approval_buttons: tool_marketing_send_approval_buttons,
+  marketing_clear_template_disable: tool_marketing_clear_template_disable,
+  marketing_set_template_disable: tool_marketing_set_template_disable,
+  marketing_pull_campaign_stats: tool_marketing_pull_campaign_stats,
+  sales_workflow_fix: tool_sales_workflow_fix,
+  workflow_resurrection_pause: tool_workflow_resurrection_pause,
+  workflow_resurrection_resume: tool_workflow_resurrection_resume,
+  pull_n8n_status: tool_pull_n8n_status,
 };
 
 // Conversation history store with TTL + LRU cap so arbitrary conversation_id values
