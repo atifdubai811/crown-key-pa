@@ -480,6 +480,9 @@ const TOOLS = [
   // ===== Block 14 (2026-05-13) — Template Library =====
   { name: 'marketing_list_all_templates', description: 'READ — lists every marketing template in WhatsJet (sourced from Meta WABA registry, not campaign history). 49 templates total. Each returns: template_name, language, status, community_hint (parsed from name: Nad Al Sheba, District One, The Valley, Standpoint, Opera Grand, Princess Tower, Burj Lake, Address Blvd, Act Tower, Sky View, St Regis, IL Primo, Oasis, Grande Meydan, Boulevard Point, Downtown, etc.), last_fired_at, days_since_fired, never_fired, sent_30d, delivery_rate_30d, is_disabled, has_creative, freshness_score. Use when Atif asks "show me virgin templates", "what templates do we have by community", "what haven\'t we fired yet". Default sort: freshness_score DESC (never-fired beats long-ago-fired beats recently-fired).', input_schema: { type: 'object', properties: { filter: { type: 'string', enum: ['active','disabled','never_fired','all'], description: 'Default all.' }, sort_by: { type: 'string', enum: ['freshness','name','delivery','last_fired'], description: 'Default freshness.' }, community_hint: { type: 'string', description: 'Filter to one community (e.g. "Opera Grand", "The Valley").' } } } },
   { name: 'marketing_recommend_template_for_segment', description: "WRITE-SUGGEST — for a given segment (DAMAC_LAGOONS, HSBC, CEO_CRYPTO, ARABIA_BUSINESS, ABU_DHABI, BECO), returns top 3 template candidates ranked by composite score: seeded/Atif-locked affinity + never_fired (+100) + meta_eligible (+50) + has_creative (+30) + recent delivery >70% (+20) - weak_delivery <30% (-30). Includes plain-English reasoning for each pick. Use when Atif asks 'recommend a template for X', 'what should I send to HSBC tomorrow', or before building a proposal manually.", input_schema: { type: 'object', properties: { segment_name: { type: 'string' } }, required: ['segment_name'] } },
+  // ===== Block 13.5 (2026-05-13) — Image-aware Marketing v2 =====
+  { name: 'marketing_generate_image', description: 'WRITE — generates an AI image (gpt-image-1, 1536x1024 landscape) for a (template, segment) pair, saves under WhatsJet media-storage on crownkey.online, returns image_url + cost. 24h cached by (template, segment) unless force_regenerate=true. Daily cap $5; cap hit alerts Atif + blocks until cleared. Cost ~1.6¢ per fresh image. Use when Atif says "generate an image for X" or before sending an approval card. Tomorrow\'s autonomous proposal builder calls this automatically per segment.', input_schema: { type: 'object', properties: { template_name: { type: 'string' }, segment: { type: 'string' }, community_context: { type: 'string', description: 'Optional override of community phrasing in the prompt; inferred from template name otherwise.' }, style_hint: { type: 'string', description: 'Optional style override; default is Crown Key navy/gold aspirational.' }, force_regenerate: { type: 'boolean', description: 'Default false. Set true to skip the 24h cache and pay for a fresh generation.' } }, required: ['template_name', 'segment'] } },
+  { name: 'marketing_swap_proposal_image', description: 'WRITE — replaces creative_url on one segment of a marketing proposal. Use when Atif uploads a custom image OR when Atlas regenerates and the new URL needs to land in the proposal. Updates segments_json[segment_index].creative_url AND .creative_status. Source field marks origin (atif_upload / ai_generated_pending_review / atlas_swap).', input_schema: { type: 'object', properties: { proposal_id: { type: 'integer' }, segment_index: { type: 'integer', description: 'Default 0.' }, image_url: { type: 'string' }, source: { type: 'string', enum: ['atif_upload', 'atlas_swap', 'ai_generated_pending_review'], description: 'Default atif_upload.' } }, required: ['proposal_id', 'image_url'] } },
 ];
 
 async function tool_bash({ command, timeout_s = 30 }) {
@@ -1405,6 +1408,34 @@ async function tool_marketing_recommend_template_for_segment({ segment_name } = 
   return _ckGet('template-recommend-for-segment', { segment: String(segment_name) }, 'marketing_recommend_template_for_segment');
 }
 
+async function tool_marketing_generate_image({ template_name, segment, community_context, style_hint, force_regenerate } = {}) {
+  if (!template_name || !segment) return { ok: false, error: 'template_name + segment required' };
+  const body = { template_name: String(template_name), segment: String(segment), created_by: 'atlas_tool' };
+  if (community_context) body.community_context = String(community_context);
+  if (style_hint) body.style_hint = String(style_hint);
+  if (force_regenerate) body.force_regenerate = true;
+  // DALL-E HTTP can take 30-60s; bump timeout to 200s.
+  try {
+    const r = await fetchT(`${CK_BASE}?action=generate-campaign-image`, {
+      method: 'POST',
+      headers: { ...ckHeaders(), 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }, 200000);
+    if (!r.ok) return { ok: false, error: `marketing_generate_image_http_${r.status}` };
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: `marketing_generate_image_unreachable: ${String(e.message || e)}` };
+  }
+}
+
+async function tool_marketing_swap_proposal_image({ proposal_id, segment_index, image_url, source } = {}) {
+  if (!proposal_id || !image_url) return { ok: false, error: 'proposal_id + image_url required' };
+  const body = { proposal_id: Number(proposal_id), image_url: String(image_url) };
+  if (segment_index !== undefined && segment_index !== null) body.segment_index = Number(segment_index);
+  if (source) body.source = String(source);
+  return _ckPost('marketing-swap-proposal-image', body, 'marketing_swap_proposal_image');
+}
+
 const TOOL_HANDLERS = {
   bash: tool_bash,
   read_file: tool_read_file,
@@ -1474,6 +1505,9 @@ const TOOL_HANDLERS = {
   // Block 14 (2026-05-13) — Template Library
   marketing_list_all_templates: tool_marketing_list_all_templates,
   marketing_recommend_template_for_segment: tool_marketing_recommend_template_for_segment,
+  // Block 13.5 (2026-05-13) — Image-aware Marketing v2
+  marketing_generate_image: tool_marketing_generate_image,
+  marketing_swap_proposal_image: tool_marketing_swap_proposal_image,
 };
 
 // Conversation history store with TTL + LRU cap so arbitrary conversation_id values
