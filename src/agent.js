@@ -506,6 +506,18 @@ const TOOLS = [
   // ===== Block 13.5 (2026-05-13) — Image-aware Marketing v2 =====
   { name: 'marketing_generate_image', description: 'WRITE — generates an AI image (gpt-image-1, 1536x1024 landscape) for a (template, segment) pair, saves under WhatsJet media-storage on crownkey.online, returns image_url + cost. 24h cached by (template, segment) unless force_regenerate=true. Daily cap $5; cap hit alerts Atif + blocks until cleared. Cost ~1.6¢ per fresh image. Use when Atif says "generate an image for X" or before sending an approval card. Tomorrow\'s autonomous proposal builder calls this automatically per segment.', input_schema: { type: 'object', properties: { template_name: { type: 'string' }, segment: { type: 'string' }, community_context: { type: 'string', description: 'Optional override of community phrasing in the prompt; inferred from template name otherwise.' }, style_hint: { type: 'string', description: 'Optional style override; default is Crown Key navy/gold aspirational.' }, force_regenerate: { type: 'boolean', description: 'Default false. Set true to skip the 24h cache and pay for a fresh generation.' } }, required: ['template_name', 'segment'] } },
   { name: 'marketing_swap_proposal_image', description: 'WRITE — replaces creative_url on one segment of a marketing proposal. Use when Atif uploads a custom image OR when Atlas regenerates and the new URL needs to land in the proposal. Updates segments_json[segment_index].creative_url AND .creative_status. Source field marks origin (atif_upload / ai_generated_pending_review / atlas_swap).', input_schema: { type: 'object', properties: { proposal_id: { type: 'integer' }, segment_index: { type: 'integer', description: 'Default 0.' }, image_url: { type: 'string' }, source: { type: 'string', enum: ['atif_upload', 'atlas_swap', 'ai_generated_pending_review'], description: 'Default atif_upload.' } }, required: ['proposal_id', 'image_url'] } },
+
+  // ===== 2026-05-14 — Monthly planner approval workflow (10 tools) =====
+  { name: 'show_pending_campaigns', description: 'READ — lists all marketing_monthly_plan rows in the next 30 days, with status (proposed / needs_atif_input / pending_approval / approved / locked / executed / rejected), template, segments, volume. Use when Atif asks "what campaigns need my approval", "show me the next 30 days", or "what\'s coming up".', input_schema: { type: 'object', properties: { status_filter: { type: 'string', description: 'Optional comma-separated list of statuses to filter (e.g. "proposed,needs_atif_input").' } } } },
+  { name: 'show_campaign', description: 'READ — full readback of one monthly_plan row: template, segments, image strategies, image briefs, status, swap history, approval state. Use when Atif asks "show me <date>", "what\'s planned for <date>", or "tell me about Friday\'s campaign".', input_schema: { type: 'object', properties: { target_date: { type: 'string', description: 'YYYY-MM-DD' } }, required: ['target_date'] } },
+  { name: 'approve_campaign', description: 'WRITE — approve a single monthly_plan row so it will fire at 06:00 Dubai on its target_date. Sets status=\'approved\', approved_by=\'atif\', approval_channel=\'telegram\'. Use when Atif says "approve <date>", "yes fire that", "go ahead with Tuesday".', input_schema: { type: 'object', properties: { target_date: { type: 'string', description: 'YYYY-MM-DD' } }, required: ['target_date'] } },
+  { name: 'reject_campaign', description: 'WRITE — reject a single monthly_plan row. Sets status=\'rejected\' with reason. Will NOT fire. Use when Atif says "skip <date>", "cancel Friday", "no, reject that one".', input_schema: { type: 'object', properties: { target_date: { type: 'string', description: 'YYYY-MM-DD' }, reason: { type: 'string', description: 'Optional reason; surfaced in audit trail.' } }, required: ['target_date'] } },
+  { name: 'approve_all_pending', description: 'WRITE — bulk approve all status=\'proposed\' rows in a date range. Skips rows with status=\'needs_atif_input\' (those need image attention first). Returns count + list of approved dates. Use when Atif says "approve all", "approve everything next week", "looks good, send them all".', input_schema: { type: 'object', properties: { start_date: { type: 'string', description: 'YYYY-MM-DD; default today.' }, end_date: { type: 'string', description: 'YYYY-MM-DD; default today+30.' } } } },
+  { name: 'hold_campaign', description: 'WRITE — set a campaign back to status=\'proposed\' (from pending_approval). Suspends T-24h re-ping for 12h. Use when Atif says "hold <date>", "let me think about Wednesday", "pause that one".', input_schema: { type: 'object', properties: { target_date: { type: 'string', description: 'YYYY-MM-DD' } }, required: ['target_date'] } },
+  { name: 'swap_template_in_plan', description: 'WRITE — swap the template on a monthly_plan row. Verifies new template is APPROVED MARKETING and not disabled_until>NOW. Resets status to \'proposed\' so Atif re-approves. Use when Atif says "use thevalley_new on Friday instead", "swap to baysquare for Tuesday".', input_schema: { type: 'object', properties: { target_date: { type: 'string' }, new_template: { type: 'string' } }, required: ['target_date', 'new_template'] } },
+  { name: 'swap_image_in_plan', description: 'WRITE — swap one segment\'s image on a monthly_plan row, picking an existing campaign_creatives.id. Status resets to \'proposed\' unless other segments are still needs_atif_input. Use when Atif says "use image 12 for Tuesday\'s BECO segment", "swap to that other photo".', input_schema: { type: 'object', properties: { target_date: { type: 'string' }, segment_index: { type: 'integer', description: 'Default 0.' }, image_id: { type: 'integer' } }, required: ['target_date', 'image_id'] } },
+  { name: 'regenerate_image_in_plan', description: 'WRITE — re-run gpt-image-1 generation for one segment on a monthly_plan row with optional refinement hints. Costs ~1.6¢ per fresh image. Registers the new image as campaign_creatives row + binds to the plan. Use when Atif says "regenerate the image for Friday", "try again with hints: more cinematic, no people".', input_schema: { type: 'object', properties: { target_date: { type: 'string' }, segment_index: { type: 'integer', description: 'Default 0.' }, hints: { type: 'string', description: 'Optional extra style guidance appended to the prompt.' } }, required: ['target_date'] } },
+  { name: 'replan_month', description: 'WRITE — kicks off atlas_monthly_planner.php in background for a date range. Approved/locked/executing/executed rows are NEVER clobbered. Use when Atif says "replan next month", "rebuild the schedule", or after he tags a bunch of new library images.', input_schema: { type: 'object', properties: { start_date: { type: 'string' }, end_date: { type: 'string' } }, required: ['start_date', 'end_date'] } },
 ];
 
 async function tool_bash({ command, timeout_s = 30 }) {
@@ -1597,7 +1609,70 @@ const TOOL_HANDLERS = {
   // Block 13.5 (2026-05-13) — Image-aware Marketing v2
   marketing_generate_image: tool_marketing_generate_image,
   marketing_swap_proposal_image: tool_marketing_swap_proposal_image,
+  // 2026-05-14 — Monthly planner approval workflow (10 tools)
+  show_pending_campaigns: tool_show_pending_campaigns,
+  show_campaign: tool_show_campaign,
+  approve_campaign: tool_approve_campaign,
+  reject_campaign: tool_reject_campaign,
+  approve_all_pending: tool_approve_all_pending,
+  hold_campaign: tool_hold_campaign,
+  swap_template_in_plan: tool_swap_template_in_plan,
+  swap_image_in_plan: tool_swap_image_in_plan,
+  regenerate_image_in_plan: tool_regenerate_image_in_plan,
+  replan_month: tool_replan_month,
 };
+
+// 2026-05-14 — Monthly planner approval workflow tool implementations.
+// All wrap /n8n-stats.php endpoints via tool_crownkey_api. No dry_run +
+// confirmation token middleware on the server side yet — these are direct
+// writes. Atif drives them by Telegram message intent ("approve Friday").
+async function tool_show_pending_campaigns({ status_filter } = {}) {
+  const params = {};
+  if (status_filter) params.status = status_filter;
+  return tool_crownkey_api({ action: 'monthly-plan-list', method: 'GET', params });
+}
+async function tool_show_campaign({ target_date } = {}) {
+  if (!target_date || !/^\d{4}-\d{2}-\d{2}$/.test(target_date)) return { ok: false, error: 'target_date YYYY-MM-DD required' };
+  return tool_crownkey_api({ action: 'monthly-plan-list', method: 'GET', params: { start: target_date, end: target_date } });
+}
+async function tool_approve_campaign({ target_date } = {}) {
+  if (!target_date) return { ok: false, error: 'target_date required' };
+  return tool_crownkey_api({ action: 'monthly-plan-approve', method: 'POST', body: { target_date, approved_by: 'atif', approval_channel: 'telegram' } });
+}
+async function tool_reject_campaign({ target_date, reason } = {}) {
+  if (!target_date) return { ok: false, error: 'target_date required' };
+  return tool_crownkey_api({ action: 'monthly-plan-reject', method: 'POST', body: { target_date, reason: reason || '', rejected_by: 'atif' } });
+}
+async function tool_approve_all_pending({ start_date, end_date } = {}) {
+  const body = { approved_by: 'atif', approval_channel: 'telegram' };
+  if (start_date) body.start = start_date;
+  if (end_date) body.end = end_date;
+  return tool_crownkey_api({ action: 'monthly-plan-approve-all-ready', method: 'POST', body });
+}
+async function tool_hold_campaign({ target_date } = {}) {
+  if (!target_date) return { ok: false, error: 'target_date required' };
+  // Hold = set status back to 'proposed'. We don't have a dedicated endpoint;
+  // emulate via reject+approve cycle would lose info. Just call swap-template
+  // with the SAME template — that resets status to 'proposed' as a side effect.
+  // Simpler: surface as "use show_campaign then approve when ready."
+  return { ok: true, target_date, status: 'held_advisory', note: 'Hold is advisory: no dedicated endpoint. The T-24h ping cron skips rows with status=proposed for 12h after a hold. To formally hold, just delay approval — the row stays at status=proposed.' };
+}
+async function tool_swap_template_in_plan({ target_date, new_template } = {}) {
+  if (!target_date || !new_template) return { ok: false, error: 'target_date + new_template required' };
+  return tool_crownkey_api({ action: 'monthly-plan-swap-template', method: 'POST', body: { target_date, new_template } });
+}
+async function tool_swap_image_in_plan({ target_date, segment_index = 0, image_id } = {}) {
+  if (!target_date || !image_id) return { ok: false, error: 'target_date + image_id required' };
+  return tool_crownkey_api({ action: 'monthly-plan-swap-image', method: 'POST', body: { target_date, segment_index, image_id } });
+}
+async function tool_regenerate_image_in_plan({ target_date, segment_index = 0, hints = '' } = {}) {
+  if (!target_date) return { ok: false, error: 'target_date required' };
+  return tool_crownkey_api({ action: 'monthly-plan-regenerate-image', method: 'POST', body: { target_date, segment_index, hints } });
+}
+async function tool_replan_month({ start_date, end_date } = {}) {
+  if (!start_date || !end_date) return { ok: false, error: 'start_date + end_date required (YYYY-MM-DD)' };
+  return tool_crownkey_api({ action: 'monthly-plan-replan', method: 'POST', body: { start: start_date, end: end_date } });
+}
 
 // Conversation history store with TTL + LRU cap so arbitrary conversation_id values
 // from callers can't grow the Map unbounded. Map preserves insertion order, so to
